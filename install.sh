@@ -26,6 +26,7 @@ UNINSTALL_MODE=0
 FORCE_UNINSTALL=0
 MOTION_RUN_USER="motion"
 MOTION_RUN_GROUP="motion"
+CAMERA_ID_OFFSET=0
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -181,6 +182,8 @@ prompt_camera_settings() {
   echo "[4/11] Camera setup"
 
   discover_camera_devices
+  prompt_camera_offset
+
   if [[ ${#CAMERA_DEVICES[@]} -gt 0 ]]; then
     echo "Discovered webcam device paths:"
     local idx
@@ -200,6 +203,21 @@ prompt_camera_settings() {
   fi
 
   prompt_camera_settings_manual
+}
+
+prompt_camera_offset() {
+  local camera_offset
+  camera_offset="$(prompt_input "Camera number offset [0]: ")"
+
+  while [[ -n "$camera_offset" && ! "$camera_offset" =~ ^[0-9]+$ ]]; do
+    camera_offset="$(prompt_input "Please enter a non-negative integer camera offset [0]: ")"
+  done
+
+  if [[ -z "$camera_offset" ]]; then
+    CAMERA_ID_OFFSET=0
+  else
+    CAMERA_ID_OFFSET="$camera_offset"
+  fi
 }
 
 select_discovered_camera_subset() {
@@ -418,7 +436,7 @@ install_motion_configs() {
 
   local idx
   for idx in "${!CAMERA_DEVICES[@]}"; do
-    local camera_id=$((idx + 1))
+    local camera_id=$((CAMERA_ID_OFFSET + idx + 1))
     local camera_device="${CAMERA_DEVICES[$idx]}"
     local camera_target="/var/lib/motion/camera-${camera_id}"
     local camera_file="$MOTION_CAMERA_DIR/camera-${camera_id}.conf"
@@ -576,10 +594,11 @@ show_summary() {
   echo "Repository: $REPO_URL (branch: $REPO_BRANCH)"
   echo "Installed path: $APP_DIR"
   echo "Environment file: $ENV_FILE"
+  echo "Camera number offset: $CAMERA_ID_OFFSET"
   echo "Configured cameras: ${#CAMERA_DEVICES[@]}"
   local idx
   for idx in "${!CAMERA_DEVICES[@]}"; do
-    echo "  - camera-$((idx + 1)): ${CAMERA_DEVICES[$idx]}"
+    echo "  - camera-$((CAMERA_ID_OFFSET + idx + 1)): ${CAMERA_DEVICES[$idx]}"
   done
   echo "Snapshot schedule:"
   for idx in "${!SNAPSHOT_TIMES[@]}"; do

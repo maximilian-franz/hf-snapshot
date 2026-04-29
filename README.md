@@ -52,6 +52,8 @@ What the installer does:
 11. Installs and links systemd service and timer units.
 12. Enables and starts motion.service and motion-snapshot.timer.
 
+During camera setup, the installer also asks for a camera number offset. Leave it at 0 on the first host, then use 4 on a second four-camera host, 8 on a third, and so on.
+
 ## Camera Discovery and Configuration
 
 - Preferred discovery source: /dev/v4l/by-path/*-video-index0
@@ -68,6 +70,8 @@ Each generated file gets:
 - camera_id N
 - video_device set to your selected device path
 - target_dir /var/lib/motion/camera-N
+
+If you enter a camera number offset during installation, the generated numbers start from that offset plus 1. For example, an offset of 4 produces camera-5, camera-6, and so on.
 
 ## Runtime Configuration
 
