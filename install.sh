@@ -272,15 +272,14 @@ prompt_camera_enrollment() {
   done
 
   echo "When ready, unplug all cameras and press Enter. The installer will wait until the persistent paths are clear before continuing."
+  echo "When ready, unplug all cameras you want to configure, then press Enter."
   prompt_input "Continue: " >/dev/null
 
-  echo "Waiting for all persistent camera devices to disappear..."
-  if ! wait_for_persistent_camera_devices_to_clear; then
-    echo "Timed out waiting for persistent camera devices to clear."
-    exit 1
-  fi
-
-  echo "All persistent camera devices are clear. Plug in the first camera when prompted."
+  # Record currently-present persistent devices as known baseline and only
+  # watch for new devices that appear after this point.
+  echo "Recording currently-present persistent devices and waiting for new devices to appear..."
+  readarray -t KNOWN_DEVICES < <(list_persistent_camera_devices)
+  echo "Recorded ${#KNOWN_DEVICES[@]} existing persistent device(s). Plug in the first camera when prompted."
 
   CAMERA_DEVICES=()
   CAMERA_NAMES=()
@@ -292,6 +291,11 @@ prompt_camera_enrollment() {
 
     local known_device_args=()
     local known_device
+    # start with baseline devices present at the time the user pressed Enter
+    for known_device in "${KNOWN_DEVICES[@]}"; do
+      known_device_args+=("$known_device")
+    done
+    # also include any devices we've already enrolled so they are not treated as new
     for known_device in "${CAMERA_DEVICES[@]}"; do
       known_device_args+=("$known_device")
     done
