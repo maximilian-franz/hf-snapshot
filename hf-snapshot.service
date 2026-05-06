@@ -1,0 +1,21 @@
+[Unit]
+Description=Capture webcam snapshots and upload them to Hugging Face
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hf-snapshot
+Environment=XDG_CACHE_HOME=/opt/hf-snapshot/.cache
+Environment=HF_HOME=/opt/hf-snapshot/.cache/huggingface
+ExecStart=/opt/hf-snapshot/.venv/bin/python3 /opt/hf-snapshot/hf-snapshot.py
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/hf-snapshot/.cache
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import os
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import TypedDict
+
+from dotenv import load_dotenv
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
+from huggingface_hub.utils import HfHubHTTPError
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+load_dotenv(SCRIPT_DIR / ".env")
+
+
+METADATA_HEADERS = ["file_name", "camera_id", "timestamp"]
+FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
+FFMPEG_INPUT_FORMAT = os.getenv("FFMPEG_INPUT_FORMAT", "mjpeg")
+FFMPEG_VIDEO_SIZE = os.getenv("FFMPEG_VIDEO_SIZE", "3840x2160")
+
+
+class MetadataRow(TypedDict):
+    file_name: str
+    camera_id: str
+    timestamp: str
+
+
+@dataclass(frozen=True)
+class Config:
+    hf_token: str
+    hf_repo_id: str
+    camera_config_file: Path
+    upload_retry_count: int
+    upload_retry_delay_seconds: float
+
+
+@dataclass(frozen=True)
+class SnapshotRecord:
+    camera_id: str
+    local_path: Path
+    remote_path: str
+    timestamp: str
+
+
+class CameraConfigRow(TypedDict):
+    device_path: str
+    camera_name: str
+
+
+def setup_logging() -> logging.Logger:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    return logging.getLogger("hf_snapshot")
+
+
+def env_required(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def load_config() -> Config:
+    return Config(
+        hf_token=env_required("HF_TOKEN"),
+        hf_repo_id=env_required("HF_REPO_ID"),
+        camera_config_file=Path(
+            os.getenv("CAMERA_CONFIG_FILE", str(SCRIPT_DIR / "cameras.json"))
+        ),
+        upload_retry_count=int(os.getenv("UPLOAD_RETRY_COUNT", "3")),
+        upload_retry_delay_seconds=float(
+            os.getenv("UPLOAD_RETRY_DELAY_SECONDS", "2.0")
+        ),
+    )
+
+
+def load_camera_config(path: Path) -> list[CameraConfigRow]:
+    if not path.exists():
+        raise RuntimeError(f"Camera config file does not exist: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    cameras = payload.get("cameras")
+    if not isinstance(cameras, list) or not cameras:
+        raise RuntimeError(f"Camera config file has no cameras: {path}")
+
+    parsed_cameras: list[CameraConfigRow] = []
+    seen_device_paths: set[str] = set()
+    seen_camera_names: set[str] = set()
+
+    for index, camera in enumerate(cameras, start=1):
+        if not isinstance(camera, dict):
+            raise RuntimeError(f"Camera config entry {index} is not an object")
+
+        device_path = camera.get("device_path")
+        camera_name = camera.get("camera_name")
+
+        if not isinstance(device_path, str) or not device_path.strip():
+            raise RuntimeError(f"Camera config entry {index} is missing device_path")
+        if not isinstance(camera_name, str) or not camera_name.strip():
+            raise RuntimeError(f"Camera config entry {index} is missing camera_name")
+        camera_name = camera_name.strip()
+        if "/" in camera_name:
+            raise RuntimeError(
+                f"Camera config entry {index} has invalid camera_name containing '/': {camera_name}"
+            )
+
+        resolved_device_path = Path(device_path)
+        if not device_path.startswith("/dev/v4l/by-path/"):
+            raise RuntimeError(
+                f"Camera config entry {index} must use a persistent /dev/v4l/by-path device path: {device_path}"
+            )
+        if not resolved_device_path.exists():
+            raise RuntimeError(
+                f"Camera config entry {index} points to a missing device path: {device_path}"
+            )
+
+        real_device_path = resolved_device_path.resolve()
+        if not real_device_path.is_char_device():
+            raise RuntimeError(
+                f"Camera config entry {index} does not resolve to a character device: {device_path}"
+            )
+        if device_path in seen_device_paths:
+            raise RuntimeError(f"Camera config contains duplicate device path: {device_path}")
+        if camera_name in seen_camera_names:
+            raise RuntimeError(f"Camera config contains duplicate camera name: {camera_name}")
+
+        seen_device_paths.add(device_path)
+        seen_camera_names.add(camera_name)
+        parsed_cameras.append(
+            {
+                "device_path": device_path,
+                "camera_name": camera_name,
+            }
+        )
+
+    return parsed_cameras
+
+
+def capture_snapshot(device: str, output: Path) -> None:
+    cmd = [
+        FFMPEG_BINARY,
+        "-y",
+        "-f",
+        "v4l2",
+        "-input_format",
+        FFMPEG_INPUT_FORMAT,
+        "-video_size",
+        FFMPEG_VIDEO_SIZE,
+        "-i",
+        device,
+        "-frames:v",
+        "1",
+        str(output),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def upload_file_with_retries(
+    api: HfApi,
+    repo_id: str,
+    token: str,
+    local_path: Path,
+    remote_path: str,
+    retry_count: int,
+    retry_delay_seconds: float,
+    logger: logging.Logger,
+) -> None:
+    retryable_errors = (HfHubHTTPError,)
+    last_error: Exception | None = None
+
+    for attempt in range(1, retry_count + 1):
+        try:
+            api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=remote_path,
+                repo_id=repo_id,
+                repo_type="dataset",
+                token=token,
+            )
+            return
+        except retryable_errors as exc:
+            last_error = exc
+            if attempt < retry_count:
+                logger.warning(
+                    "Upload attempt %s/%s failed for %s: %s. Retrying in %.1f seconds.",
+                    attempt,
+                    retry_count,
+                    local_path,
+                    exc,
+                    retry_delay_seconds,
+                )
+                time.sleep(retry_delay_seconds)
+            else:
+                logger.error(
+                    "Upload attempt %s/%s failed for %s: %s",
+                    attempt,
+                    retry_count,
+                    local_path,
+                    exc,
+                )
+
+    if last_error is None:
+        raise RuntimeError(f"Upload failed for {local_path} but no retryable exception was captured")
+
+    raise last_error
+
+
+def download_metadata_csv(
+    repo_id: str,
+    token: str,
+    logger: logging.Logger,
+) -> list[MetadataRow]:
+    try:
+        metadata_path = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename="metadata.csv",
+            token=token,
+        )
+    except EntryNotFoundError:
+        logger.info(
+            "Remote metadata.csv not found yet. Starting with an empty metadata table."
+        )
+        return []
+
+    rows: list[MetadataRow] = []
+    with open(metadata_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(
+                {
+                    "file_name": row["file_name"],
+                    "camera_id": row["camera_id"],
+                    "timestamp": row["timestamp"],
+                }
+            )
+    return rows
+
+
+def write_metadata_csv(path: Path, rows: list[MetadataRow]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=METADATA_HEADERS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def merge_metadata_rows(
+    existing_rows: list[MetadataRow],
+    new_records: list[SnapshotRecord],
+) -> list[MetadataRow]:
+    merged_rows = list(existing_rows)
+    file_name_to_index = {
+        row["file_name"]: index for index, row in enumerate(merged_rows)
+    }
+
+    for record in new_records:
+        row = {
+            "file_name": f"{record.camera_id}/{record.local_path.name}",
+            "camera_id": record.camera_id,
+            "timestamp": record.timestamp,
+        }
+
+        existing_index = file_name_to_index.get(row["file_name"])
+        if existing_index is not None:
+            # Keep row ordering stable while refreshing data for duplicate keys.
+            merged_rows[existing_index] = row
+        else:
+            file_name_to_index[row["file_name"]] = len(merged_rows)
+            merged_rows.append(row)
+
+    return merged_rows
+
+
+def main() -> int:
+    logger = setup_logging()
+    config = load_config()
+
+    logger.info("Starting snapshot capture and publish run.")
+
+    camera_configs = load_camera_config(config.camera_config_file)
+    logger.info(
+        "Loaded camera config from %s with cameras: %s",
+        config.camera_config_file,
+        ", ".join(
+            f"{camera['camera_name']}={camera['device_path']}" for camera in camera_configs
+        ),
+    )
+
+    failures: list[str] = []
+    records: list[SnapshotRecord] = []
+
+    with tempfile.TemporaryDirectory(prefix="hf-snapshot-captures-") as tmpdir:
+        capture_dir = Path(tmpdir)
+        for camera in camera_configs:
+            camera_id = camera["camera_name"]
+            device_path = Path(camera["device_path"])
+            capture_started_at = datetime.now().astimezone()
+            output_name = f"{camera_id}-{capture_started_at.strftime('%Y-%m-%dT%H-%M-%S-%f')}.jpg"
+            output_path = capture_dir / output_name
+
+            try:
+                capture_snapshot(str(device_path), output_path)
+            except subprocess.CalledProcessError as exc:
+                logger.exception("ffmpeg capture failed for %s: %s", device_path, exc)
+                failures.append(f"{camera_id}: snapshot capture failed: {exc}")
+                continue
+            except FileNotFoundError as exc:
+                logger.exception("ffmpeg executable not found: %s", exc)
+                return 1
+
+            records.append(
+                SnapshotRecord(
+                    camera_id=camera_id,
+                    local_path=output_path,
+                    remote_path=f"{camera_id}/{output_path.name}",
+                    timestamp=capture_started_at.isoformat(timespec="seconds"),
+                )
+            )
+
+    if not records:
+        logger.error("No snapshots were captured successfully.")
+        for failure in failures:
+            logger.error("  %s", failure)
+        return 1
+
+    api = HfApi(token=config.hf_token)
+    existing_rows = download_metadata_csv(
+        repo_id=config.hf_repo_id,
+        token=config.hf_token,
+        logger=logger,
+    )
+
+    for record in records:
+        try:
+            upload_file_with_retries(
+                api=api,
+                repo_id=config.hf_repo_id,
+                token=config.hf_token,
+                local_path=record.local_path,
+                remote_path=record.remote_path,
+                retry_count=config.upload_retry_count,
+                retry_delay_seconds=config.upload_retry_delay_seconds,
+                logger=logger,
+            )
+            logger.info("Uploaded %s -> %s.", record.local_path, record.remote_path)
+        except Exception as exc:
+            failures.append(f"{record.camera_id}: image upload failed: {exc}")
+
+    if failures:
+        logger.error("Run completed with failures during image upload:")
+        for failure in failures:
+            logger.error("  %s", failure)
+        return 1
+
+    updated_rows = merge_metadata_rows(existing_rows, records)
+
+    with tempfile.TemporaryDirectory(prefix="hf-snapshot-metadata-") as tmpdir:
+        metadata_local_path = Path(tmpdir) / "metadata.csv"
+        write_metadata_csv(metadata_local_path, updated_rows)
+
+        try:
+            upload_file_with_retries(
+                api=api,
+                repo_id=config.hf_repo_id,
+                token=config.hf_token,
+                local_path=metadata_local_path,
+                remote_path="metadata.csv",
+                retry_count=config.upload_retry_count,
+                retry_delay_seconds=config.upload_retry_delay_seconds,
+                logger=logger,
+            )
+            logger.info("Uploaded updated metadata.csv.")
+        except Exception as exc:
+            logger.error("Metadata upload failed: %s", exc)
+            return 1
+
+    logger.info("Run completed successfully.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,29 +1,30 @@
-# motion-snapshot
+# hf-snapshot
 
-Capture snapshots from Motion-managed webcams and upload them to a Hugging Face dataset on a schedule.
+Capture snapshots from persistent V4L device paths with ffmpeg and upload them to a Hugging Face dataset on a schedule.
 
 This project includes:
-- A Python uploader: [motion-snapshot.py](motion-snapshot.py)
-- A systemd service: [motion-snapshot.service](motion-snapshot.service)
-- A systemd timer: [motion-snapshot.timer](motion-snapshot.timer)
-- Motion base config: [motion.conf](motion.conf)
-- Camera template config: [camera-1.conf](camera-1.conf)
+- A Python uploader: [hf-snapshot.py](hf-snapshot.py)
+- A systemd service: [hf-snapshot.service](hf-snapshot.service)
+- A systemd timer: [hf-snapshot.timer](hf-snapshot.timer)
 - Interactive installer: [install.sh](install.sh)
 
 ## How It Works
 
-1. Motion is configured to store snapshots under /var/lib/motion/camera-N.
-2. The uploader triggers a fresh snapshot through Motion webcontrol.
-3. New snapshot files are detected per camera directory.
-4. Images are uploaded to your Hugging Face dataset.
-5. metadata.csv is updated in the same dataset.
-6. Snapshot files are cleaned from camera directories after a successful run.
+1. The installer asks you to unplug all cameras you want to enroll.
+2. You plug cameras in one at a time, and the installer detects each persistent `/dev/v4l/by-path` device as it appears.
+3. You assign a name to each camera during installation.
+4. The installer writes a small camera mapping file in /opt/hf-snapshot.
+5. ffmpeg captures one snapshot per configured camera into a temporary workspace.
+6. Images are uploaded to your Hugging Face dataset.
+7. metadata.csv is updated in the same dataset.
 
 ## Requirements
 
 - Linux host with systemd
 - Root access for installation
 - Webcam(s) exposed as V4L devices
+- Persistent device paths under /dev/v4l/by-path
+- ffmpeg installed on the host
 - Internet access to Hugging Face
 - A Hugging Face dataset repo and a write-capable token
 
@@ -35,61 +36,40 @@ Run the installer interactively as root. It is designed for interactive mode and
 
 Example:
 
-	curl -fsSL https://raw.githubusercontent.com/maximilian-franz/motion-snapshot/main/install.sh | sudo bash
+	curl -fsSL https://raw.githubusercontent.com/maximilian-franz/hf-snapshot/main/install.sh | sudo bash
 
 What the installer does:
 
-1. Installs required packages (git, motion, python3, python3-venv, openssl, ca-certificates).
-2. Clones or updates this repository to /opt/motion-snapshot.
+1. Installs required packages (git, ffmpeg, python3, python3-venv, openssl, ca-certificates).
+2. Clones or updates this repository to /opt/hf-snapshot.
 3. Prompts for Hugging Face repo ID and token.
-4. Auto-discovers webcams via /dev/v4l/by-path/*-video-index0 (fallback to /dev/video*).
-5. Lets you confirm discovered cameras or enter them manually.
-6. Prompts for snapshot schedule times (default: 06:00, 14:00, 22:00, or custom HH:MM times).
-7. Generates a Motion webcontrol password.
-8. Installs Motion config to /etc/motion and camera configs to /etc/motion/conf.d.
-9. Writes /opt/motion-snapshot/.env with your Hugging Face settings and generated Motion credentials.
-10. Creates a virtual environment in /opt/motion-snapshot/.venv and installs Python dependencies.
-11. Installs and links systemd service and timer units.
-12. Writes a systemd drop-in for motion.service with restart-on-failure settings.
-13. Enables and starts motion.service and motion-snapshot.timer.
-
-During camera setup, the installer also asks for a camera number offset. Leave it at 0 on the first host, then use 4 on a second four-camera host, 8 on a third, and so on.
-
-## Camera Discovery and Configuration
-
-- Preferred discovery source: /dev/v4l/by-path/*-video-index0
-- Fallback discovery source: /dev/video*
-- If auto-discovery is not correct for your setup, choose manual mode in the installer.
-
-The installer generates camera configs from [camera-1.conf](camera-1.conf) and writes:
-
-- /etc/motion/conf.d/camera-1.conf
-- /etc/motion/conf.d/camera-2.conf
-- ...
-
-Each generated file gets:
-- camera_id N
-- video_device set to your selected device path
-- target_dir /var/lib/motion/camera-N
-
-If you enter a camera number offset during installation, the generated numbers start from that offset plus 1. For example, an offset of 4 produces camera-5, camera-6, and so on.
+4. Prompts you to unplug all cameras, then connect them one at a time.
+5. Detects each persistent camera path under /dev/v4l/by-path and prompts you to name it.
+6. Writes a camera mapping file in /opt/hf-snapshot/cameras.json.
+7. Prompts for snapshot schedule times (default: 06:00, 14:00, 22:00, or custom HH:MM times).
+8. Writes /opt/hf-snapshot/.env with your Hugging Face, camera, and ffmpeg settings.
+9. Creates a virtual environment in /opt/hf-snapshot/.venv and installs Python dependencies.
+10. Installs and links systemd service and timer units.
+11. Enables and starts hf-snapshot.timer.
 
 ## Runtime Configuration
 
-Environment variables are stored in /opt/motion-snapshot/.env.
+Environment variables are stored in /opt/hf-snapshot/.env.
 
 Main variables:
 - HF_REPO_ID
 - HF_TOKEN
-- MOTION_SNAPSHOT_ENDPOINT
-- MOTION_SNAPSHOT_USER
-- MOTION_SNAPSHOT_PASSWORD
-- MOTION_SNAPSHOTS_ROOT
-- HTTP_TIMEOUT_SECONDS
-- SNAPSHOT_WAIT_TIMEOUT_SECONDS
-- SNAPSHOT_POLL_INTERVAL_SECONDS
+- CAMERA_CONFIG_FILE
+- FFMPEG_BINARY
+- FFMPEG_INPUT_FORMAT
+- FFMPEG_VIDEO_SIZE
 - UPLOAD_RETRY_COUNT
 - UPLOAD_RETRY_DELAY_SECONDS
+
+Camera mapping file:
+	/opt/hf-snapshot/cameras.json
+
+Each entry maps a persistent device path to a configured camera name.
 
 ## Scheduling
 
@@ -101,37 +81,33 @@ If you accept defaults, it uses:
 - 14:00
 - 22:00
 
-The installer writes your selected times into [motion-snapshot.timer](motion-snapshot.timer) as OnCalendar entries.
+The installer writes your selected times into [hf-snapshot.timer](hf-snapshot.timer) as OnCalendar entries.
 
 To change the schedule later, either:
 
 - Re-run the installer and enter new times when prompted.
-- Or edit [motion-snapshot.timer](motion-snapshot.timer) manually, then reload and restart the timer:
+- Or edit [hf-snapshot.timer](hf-snapshot.timer) manually, then reload and restart the timer:
 
 	sudo systemctl daemon-reload
-	sudo systemctl restart motion-snapshot.timer
+	sudo systemctl restart hf-snapshot.timer
 
 ## Useful Commands
 
-Check Motion:
-
-	sudo systemctl status motion.service
-
 Check timer:
 
-	sudo systemctl status motion-snapshot.timer
+	sudo systemctl status hf-snapshot.timer
 
 Run one upload immediately:
 
-	sudo systemctl start motion-snapshot.service
+	sudo systemctl start hf-snapshot.service
 
 See uploader logs:
 
-	sudo journalctl -u motion-snapshot.service -n 200 --no-pager
+	sudo journalctl -u hf-snapshot.service -n 200 --no-pager
 
 See timer logs:
 
-	sudo journalctl -u motion-snapshot.timer -n 200 --no-pager
+	sudo journalctl -u hf-snapshot.timer -n 200 --no-pager
 
 ## Updating
 
@@ -150,47 +126,35 @@ Skip the confirmation prompt:
 What uninstall does:
 
 - Stops and disables:
-	- motion-snapshot.timer
-	- motion-snapshot.service
-	- motion.service
+	- hf-snapshot.timer
+	- hf-snapshot.service
 - Removes systemd links:
-	- /etc/systemd/system/motion-snapshot.service
-	- /etc/systemd/system/motion-snapshot.timer
+	- /etc/systemd/system/hf-snapshot.service
+	- /etc/systemd/system/hf-snapshot.timer
 - Removes installed app directory:
-	- /opt/motion-snapshot
-- Removes Motion configs managed by this installer:
-	- /etc/motion/motion.conf
-	- /etc/motion/conf.d/camera-*.conf
-- Removes dedicated service user/group (if present):
-	- motion-snapshot user
-	- motion-snapshot group
+	- /opt/hf-snapshot
 
 ## Troubleshooting
 
 No cameras discovered:
-- Verify devices under /dev/v4l/by-path and /dev/video.
-- Re-run installer and choose manual camera setup if needed.
+- Verify devices under /dev/v4l/by-path.
+- Verify ffmpeg can access the device and that the V4L driver is loaded.
 
 Service runs but no snapshots upload:
 - Check uploader logs with journalctl.
-- Verify Hugging Face token and repo ID in /opt/motion-snapshot/.env.
-- Verify Motion webcontrol endpoint and credentials.
-
-Motion cannot read config:
-- Ensure /etc/motion/motion.conf and /etc/motion/conf.d/*.conf exist and permissions are correct for your Motion service user/group.
+- Verify Hugging Face token and repo ID in /opt/hf-snapshot/.env.
+- Verify ffmpeg is installed and that the configured input format and video size match your camera.
+- Verify the camera names and persistent device paths in /opt/hf-snapshot/cameras.json.
 
 ## Security Notes
 
-- The installer creates random Motion webcontrol credentials.
-- Secrets are stored in /opt/motion-snapshot/.env (mode 640).
-- The uploader service runs as a dedicated system user motion-snapshot.
+- Secrets are stored in /opt/hf-snapshot/.env (mode 640).
+- The uploader service runs as root with a restricted systemd sandbox.
 
 ## Project Files
 
 - [install.sh](install.sh): interactive installer
-- [motion-snapshot.py](motion-snapshot.py): uploader implementation
-- [motion-snapshot.service](motion-snapshot.service): oneshot systemd unit
-- [motion-snapshot.timer](motion-snapshot.timer): schedule definition
-- [motion.conf](motion.conf): base Motion config template
-- [camera-1.conf](camera-1.conf): camera config template
+- [hf-snapshot.py](hf-snapshot.py): uploader implementation
+- [hf-snapshot.service](hf-snapshot.service): oneshot systemd unit
+- [hf-snapshot.timer](hf-snapshot.timer): schedule definition
 - [requirements.txt](requirements.txt): Python dependencies
