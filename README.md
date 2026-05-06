@@ -50,7 +50,8 @@ What the installer does:
 9. Writes /opt/motion-snapshot/.env with your Hugging Face settings and generated Motion credentials.
 10. Creates a virtual environment in /opt/motion-snapshot/.venv and installs Python dependencies.
 11. Installs and links systemd service and timer units.
-12. Enables and starts motion.service and motion-snapshot.timer.
+12. Writes a systemd drop-in for motion.service with restart-on-failure settings.
+13. Enables and starts motion.service and motion-snapshot.timer.
 
 During camera setup, the installer also asks for a camera number offset. Leave it at 0 on the first host, then use 4 on a second four-camera host, 8 on a third, and so on.
 

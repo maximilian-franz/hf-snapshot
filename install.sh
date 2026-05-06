@@ -14,6 +14,8 @@ SERVICE_FILE="$APP_DIR/motion-snapshot.service"
 TIMER_FILE="$APP_DIR/motion-snapshot.timer"
 SERVICE_LINK="$SYSTEMD_DIR/motion-snapshot.service"
 TIMER_LINK="$SYSTEMD_DIR/motion-snapshot.timer"
+MOTION_SERVICE_DROPIN_DIR="$SYSTEMD_DIR/motion.service.d"
+MOTION_SERVICE_DROPIN_FILE="$MOTION_SERVICE_DROPIN_DIR/override.conf"
 
 APP_USER="motion-snapshot"
 APP_GROUP="motion-snapshot"
@@ -558,7 +560,7 @@ patch_timer_unit() {
 }
 
 install_systemd_units() {
-  echo "[10/11] Installing systemd service and timer..."
+  echo "[10/12] Installing systemd service and timer..."
 
   if [[ ! -f "$SERVICE_FILE" || ! -f "$TIMER_FILE" ]]; then
     echo "Service or timer file missing in repository."
@@ -577,8 +579,27 @@ install_systemd_units() {
   systemctl daemon-reload
 }
 
+install_motion_service_override() {
+  echo "[11/12] Installing Motion service override..."
+
+  mkdir -p "$MOTION_SERVICE_DROPIN_DIR"
+
+  cat >"$MOTION_SERVICE_DROPIN_FILE" <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+EOF
+
+  chmod 644 "$MOTION_SERVICE_DROPIN_FILE"
+  chown root:root "$MOTION_SERVICE_DROPIN_FILE"
+
+  systemctl daemon-reload
+}
+
 enable_and_start_services() {
-  echo "[11/11] Enabling and starting services..."
+  echo "[12/12] Enabling and starting services..."
 
   systemctl enable --now motion.service
   systemctl enable motion-snapshot.service
@@ -655,6 +676,8 @@ uninstall_everything() {
   echo "[UNINSTALL] Removing systemd links and reloading daemon..."
 
   rm -f "$SERVICE_LINK" "$TIMER_LINK"
+  rm -f "$MOTION_SERVICE_DROPIN_FILE"
+  rmdir "$MOTION_SERVICE_DROPIN_DIR" >/dev/null 2>&1 || true
   systemctl daemon-reload
 
   echo "[UNINSTALL] Removing installed application files..."
@@ -704,6 +727,7 @@ main() {
   install_env_file "$motion_password"
   install_python_env
   install_systemd_units
+  install_motion_service_override
   enable_and_start_services
   show_summary "$motion_password"
 }
