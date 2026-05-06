@@ -131,9 +131,17 @@ Use the installer in uninstall mode:
 
 	sudo bash install.sh --uninstall
 
+If you do not have a local copy of the installer, you can uninstall directly from GitHub:
+
+	curl -fsSL https://raw.githubusercontent.com/maximilian-franz/hf-snapshot/main/install.sh | sudo bash -s -- --uninstall
+
 Skip the confirmation prompt:
 
 	sudo bash install.sh --uninstall --yes
+
+From GitHub (no confirmation prompt):
+
+	curl -fsSL https://raw.githubusercontent.com/maximilian-franz/hf-snapshot/main/install.sh | sudo bash -s -- --uninstall --yes
 
 What uninstall does:
 
