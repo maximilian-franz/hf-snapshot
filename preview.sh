@@ -27,6 +27,8 @@ done &
 ffmpeg_pid=$!
 
 # Serve the preview directory via a simple HTTP server (foreground)
-python3 -m http.server "$port" --bind 127.0.0.1
+# NOTE: binding to 0.0.0.0 makes the preview reachable from the network.
+# This is convenient for remote access but may expose the preview publicly.
+python3 -m http.server "$port" --bind 0.0.0.0
 
 exit 0

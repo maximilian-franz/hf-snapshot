@@ -28,7 +28,7 @@ You can specify a rotation of `0`, `90`, `180`, or `270` degrees for each camera
 Preview helper requirement
 --------------------------
 
-The installer requires a helper script `preview.sh` in the repository root. During installation the installer will make `preview.sh` executable (mode 755) and run it transiently via `systemd-run` to provide the live preview. Ensure your cloned repository includes `preview.sh` at the root; this file is included in the project and the installer will use it automatically.
+The installer requires a helper script `preview.sh` in the repository root. During installation the installer will make `preview.sh` executable (mode 755) and run it transiently via `systemd-run` to provide the live preview. The preview server binds to `0.0.0.0` so it is reachable from other hosts on your network; this is convenient for remote viewing but may expose the preview publicly. If you'd like to restrict access, use SSH port forwarding or firewall rules. Ensure your cloned repository includes `preview.sh` at the root; this file is included in the project and the installer will use it automatically.
 
 ## Requirements
 

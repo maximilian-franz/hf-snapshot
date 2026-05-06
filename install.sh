@@ -323,8 +323,13 @@ prompt_camera_enrollment() {
     systemd-run --unit="$unit_name" --description="hf-snapshot preview ${detected_device}" /bin/bash "$APP_DIR/preview.sh" "${detected_device}" "$preview_port" "$preview_dir" >/dev/null 2>&1 || true
     PREVIEW_UNITS+=("$unit_name")
 
+    # Determine a likely public IP for convenience (may be empty)
+    HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     echo "Preview for ${detected_device} available at: http://127.0.0.1:${preview_port}/latest.jpg"
-    echo "Open that URL on this machine (or use SSH port forwarding) to inspect the camera image."
+    if [[ -n "$HOST_IP" ]]; then
+      echo "Also accessible on the local network at: http://${HOST_IP}:${preview_port}/latest.jpg"
+    fi
+    echo "Warning: the preview server is bound to 0.0.0.0 and may be reachable from the network. Use firewall rules or SSH port forwarding if you want to restrict access."
 
     local camera_name
     while true; do
