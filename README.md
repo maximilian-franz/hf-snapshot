@@ -58,7 +58,7 @@ What the installer does:
 4. Prompts you to unplug all cameras, then connect them one at a time.
 5. Detects each persistent camera path under /dev/v4l/by-path and prompts you to name it.
 6. Writes a camera mapping file in /opt/hf-snapshot/cameras.json.
-7. Prompts for snapshot schedule times (default: 06:00, 14:00, 22:00, or custom HH:MM times).
+7. Prompts for snapshot schedule times (default: 06:00, 08:00, 10:00, 12:00, 14:00, 16:00, 18:00, 20:00, 22:00, or custom HH:MM times).
 8. Writes /opt/hf-snapshot/.env with your Hugging Face, camera, and ffmpeg settings.
 9. Creates a virtual environment in /opt/hf-snapshot/.venv and installs Python dependencies.
 10. Installs and links systemd service and timer units.

@@ -436,14 +436,14 @@ time_already_selected() {
 
 prompt_snapshot_schedule() {
   echo "[6/11] Snapshot schedule setup"
-  echo "Default times: 06:00, 14:00, 22:00"
+  echo "Default times: 06:00, 08:00, 10:00, 12:00, 14:00, 16:00, 18:00, 20:00, 22:00"
   echo "Times are local server time in 24-hour HH:MM format."
 
   local use_defaults
   use_defaults="$(prompt_input "Use default times? [Y/n]: ")"
 
   if [[ -z "$use_defaults" || "$use_defaults" =~ ^[Yy]$ ]]; then
-    SNAPSHOT_TIMES=("06:00" "14:00" "22:00")
+    SNAPSHOT_TIMES=("06:00" "08:00" "10:00" "12:00" "14:00" "16:00" "18:00" "20:00" "22:00")
     return
   fi
 
