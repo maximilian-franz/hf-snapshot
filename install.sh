@@ -24,6 +24,18 @@ declare -a PREVIEW_DIRS=()
 UNINSTALL_MODE=0
 FORCE_UNINSTALL=0
 
+EXISTING_HF_REPO_ID=""
+EXISTING_HF_TOKEN=""
+EXISTING_TELEGRAM_BOT_TOKEN=""
+EXISTING_TELEGRAM_CHAT_ID=""
+EXISTING_ENV_FOUND=0
+
+EXISTING_CAMERAS_FOUND=0
+KEEP_EXISTING_CAMERA_CONFIG=0
+
+declare -a EXISTING_SNAPSHOT_TIMES=()
+EXISTING_SCHEDULE_FOUND=0
+
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "This installer must run as root."
@@ -101,6 +113,60 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+read_env_value() {
+  local key="$1"
+  local file="$2"
+  grep -E "^${key}=" "$file" | head -n 1 | cut -d'=' -f2-
+}
+
+prompt_default_yes() {
+  local prompt="$1"
+  local answer
+  answer="$(prompt_input "$prompt [Y/n]: ")"
+  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]
+}
+
+detect_existing_config() {
+  EXISTING_HF_REPO_ID=""
+  EXISTING_HF_TOKEN=""
+  EXISTING_TELEGRAM_BOT_TOKEN=""
+  EXISTING_TELEGRAM_CHAT_ID=""
+  EXISTING_ENV_FOUND=0
+
+  EXISTING_CAMERAS_FOUND=0
+  KEEP_EXISTING_CAMERA_CONFIG=0
+
+  EXISTING_SNAPSHOT_TIMES=()
+  EXISTING_SCHEDULE_FOUND=0
+
+  if [[ -f "$ENV_FILE" ]]; then
+    EXISTING_ENV_FOUND=1
+    EXISTING_HF_REPO_ID="$(read_env_value HF_REPO_ID "$ENV_FILE")"
+    EXISTING_HF_TOKEN="$(read_env_value HF_TOKEN "$ENV_FILE")"
+    EXISTING_TELEGRAM_BOT_TOKEN="$(read_env_value TELEGRAM_BOT_TOKEN "$ENV_FILE")"
+    EXISTING_TELEGRAM_CHAT_ID="$(read_env_value TELEGRAM_CHAT_ID "$ENV_FILE")"
+  fi
+
+  if [[ -f "$CAMERA_CONFIG_FILE" ]]; then
+    EXISTING_CAMERAS_FOUND=1
+  fi
+
+  local timer_candidates=("$TIMER_FILE" "$TIMER_LINK")
+  local timer_path
+  for timer_path in "${timer_candidates[@]}"; do
+    [[ -f "$timer_path" ]] || continue
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^OnCalendar=.*\ ([0-9]{2}:[0-9]{2}):[0-9]{2}$ ]]; then
+        EXISTING_SNAPSHOT_TIMES+=("${BASH_REMATCH[1]}")
+      fi
+    done <"$timer_path"
+    if [[ ${#EXISTING_SNAPSHOT_TIMES[@]} -gt 0 ]]; then
+      EXISTING_SCHEDULE_FOUND=1
+      break
+    fi
+  done
+}
+
 install_packages() {
   echo "[1/11] Installing required packages..."
 
@@ -155,6 +221,14 @@ prompt_hf_settings() {
   echo "  - Create an access token at: https://huggingface.co/settings/tokens"
   echo "  - Token needs write access for the target dataset"
 
+  if [[ "$EXISTING_ENV_FOUND" -eq 1 && -n "$EXISTING_HF_REPO_ID" && -n "$EXISTING_HF_TOKEN" ]]; then
+    if prompt_default_yes "Existing Hugging Face configuration found for ${EXISTING_HF_REPO_ID}. Keep it"; then
+      HF_REPO_ID="$EXISTING_HF_REPO_ID"
+      HF_TOKEN="$EXISTING_HF_TOKEN"
+      return
+    fi
+  fi
+
   HF_REPO_ID="$(prompt_input "Enter HF repo ID (e.g. your-name/hf-snapshots): ")"
   while [[ -z "${HF_REPO_ID}" ]]; do
     HF_REPO_ID="$(prompt_input "HF repo ID cannot be empty. Enter HF repo ID: ")"
@@ -170,6 +244,14 @@ prompt_telegram_settings() {
   echo "[3b/11] Optional: Telegram alerts"
   echo "You can provide a Telegram bot token and chat ID to receive error alerts."
   echo "Leave blank to skip Telegram alerts."
+
+  if [[ "$EXISTING_ENV_FOUND" -eq 1 && ( -n "$EXISTING_TELEGRAM_BOT_TOKEN" || -n "$EXISTING_TELEGRAM_CHAT_ID" ) ]]; then
+    if prompt_default_yes "Existing Telegram configuration found. Keep it"; then
+      TELEGRAM_BOT_TOKEN="$EXISTING_TELEGRAM_BOT_TOKEN"
+      TELEGRAM_CHAT_ID="$EXISTING_TELEGRAM_CHAT_ID"
+      return
+    fi
+  fi
 
   TELEGRAM_BOT_TOKEN="$(prompt_secret "Telegram bot token (leave empty to skip): ")"
   TELEGRAM_CHAT_ID="$(prompt_input "Telegram chat ID (leave empty to skip): ")"
@@ -199,20 +281,6 @@ list_persistent_camera_devices() {
   fi
 
   printf '%s\n' "${devices[@]:-}"
-}
-
-wait_for_persistent_camera_devices_to_clear() {
-  local attempt
-
-  for attempt in {1..60}; do
-    if [[ -z "$(list_persistent_camera_devices)" ]]; then
-      return 0
-    fi
-
-    sleep 1
-  done
-
-  return 1
 }
 
 wait_for_new_persistent_camera_device() {
@@ -265,13 +333,24 @@ prompt_camera_enrollment() {
   echo "[4/11] Camera enrollment"
   echo "Unplug every camera you want to configure, then connect them one at a time."
 
+  if [[ "$EXISTING_CAMERAS_FOUND" -eq 1 ]]; then
+    echo "Existing camera configuration file found at: $CAMERA_CONFIG_FILE"
+    echo "Current camera configuration contents:"
+    cat "$CAMERA_CONFIG_FILE"
+    if prompt_default_yes "Keep existing camera configuration"; then
+      KEEP_EXISTING_CAMERA_CONFIG=1
+      return
+    fi
+  fi
+
+  KEEP_EXISTING_CAMERA_CONFIG=0
+
   local camera_count
   camera_count="$(prompt_input "How many cameras do you want to enroll? ")"
   while [[ ! "$camera_count" =~ ^[1-9][0-9]*$ ]]; do
     camera_count="$(prompt_input "Please enter a positive integer camera count: ")"
   done
 
-  echo "When ready, unplug all cameras and press Enter. The installer will wait until the persistent paths are clear before continuing."
   echo "When ready, unplug all cameras you want to configure, then press Enter."
   prompt_input "Continue: " >/dev/null
 
@@ -372,6 +451,11 @@ prompt_camera_enrollment() {
 install_camera_config() {
   echo "[5/11] Writing camera config file..."
 
+  if [[ "$KEEP_EXISTING_CAMERA_CONFIG" -eq 1 && -f "$CAMERA_CONFIG_FILE" ]]; then
+    echo "Keeping existing camera config file: $CAMERA_CONFIG_FILE"
+    return
+  fi
+
   local mapping_file
   mapping_file="$(mktemp)"
 
@@ -438,6 +522,16 @@ prompt_snapshot_schedule() {
   echo "[6/11] Snapshot schedule setup"
   echo "Default times: 06:00, 08:00, 10:00, 12:00, 14:00, 16:00, 18:00, 20:00, 22:00"
   echo "Times are local server time in 24-hour HH:MM format."
+
+  if [[ "$EXISTING_SCHEDULE_FOUND" -eq 1 && ${#EXISTING_SNAPSHOT_TIMES[@]} -gt 0 ]]; then
+    local existing_display
+    existing_display="$(printf '%s, ' "${EXISTING_SNAPSHOT_TIMES[@]}")"
+    existing_display="${existing_display%, }"
+    if prompt_default_yes "Existing schedule found (${existing_display}). Keep it"; then
+      SNAPSHOT_TIMES=("${EXISTING_SNAPSHOT_TIMES[@]}")
+      return
+    fi
+  fi
 
   local use_defaults
   use_defaults="$(prompt_input "Use default times? [Y/n]: ")"
@@ -658,6 +752,7 @@ main() {
 
   require_tty
   install_packages
+  detect_existing_config
   fetch_repository
   prompt_hf_settings
   prompt_telegram_settings
