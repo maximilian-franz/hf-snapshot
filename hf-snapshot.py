@@ -183,26 +183,6 @@ def load_camera_config(path: Path) -> list[CameraConfigRow]:
 
 
 def capture_snapshot(device: str, output: Path, rotation: int = 0) -> None:
-    if CAPTURE_WARMUP_SECONDS > 0:
-        warmup_cmd = [
-            FFMPEG_BINARY,
-            "-y",
-            "-f",
-            "v4l2",
-            "-input_format",
-            FFMPEG_INPUT_FORMAT,
-            "-video_size",
-            FFMPEG_VIDEO_SIZE,
-            "-i",
-            device,
-            "-t",
-            str(CAPTURE_WARMUP_SECONDS),
-            "-f",
-            "null",
-            "-",
-        ]
-        subprocess.run(warmup_cmd, check=True)
-
     cmd = [
         FFMPEG_BINARY,
         "-y",
@@ -216,16 +196,20 @@ def capture_snapshot(device: str, output: Path, rotation: int = 0) -> None:
         device,
     ]
 
-    vf = None
-    if rotation == 90:
-        vf = "transpose=1"
-    elif rotation == 180:
-        vf = "transpose=1,transpose=1"
-    elif rotation == 270:
-        vf = "transpose=2"
+    vf_parts: list[str] = []
+    if CAPTURE_WARMUP_SECONDS > 0:
+        vf_parts.append(f"select='gte(t,{CAPTURE_WARMUP_SECONDS})'")
 
-    if vf:
-        cmd.extend(["-vf", vf])
+    if rotation == 90:
+        vf_parts.append("transpose=1")
+    elif rotation == 180:
+        vf_parts.append("transpose=1")
+        vf_parts.append("transpose=1")
+    elif rotation == 270:
+        vf_parts.append("transpose=2")
+
+    if vf_parts:
+        cmd.extend(["-vf", ",".join(vf_parts), "-fps_mode", "vfr"])
 
     cmd.extend(["-frames:v", "1", str(output)])
     subprocess.run(cmd, check=True)
