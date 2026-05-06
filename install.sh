@@ -364,6 +364,30 @@ prompt_camera_enrollment() {
   CAMERA_NAMES=()
   CAMERA_ROTATIONS=()
 
+  # Start one preview service for the whole enrollment lifecycle.
+  local preview_dir
+  preview_dir="$(mktemp -d)"
+  PREVIEW_DIRS+=("$preview_dir")
+  local preview_port=8080
+  local preview_device_file="$preview_dir/current_device"
+  local preview_unit_name="hf-snapshot-preview-${RANDOM}.service"
+
+  if [[ ! -x "$APP_DIR/preview.sh" ]]; then
+    echo "Preview helper $APP_DIR/preview.sh not found or not executable. Ensure the repository contains preview.sh" >&2
+    exit 1
+  fi
+
+  systemd-run --unit="$preview_unit_name" --description="hf-snapshot preview server" /bin/bash "$APP_DIR/preview.sh" "$preview_port" "$preview_dir" >/dev/null 2>&1 || true
+  PREVIEW_UNITS+=("$preview_unit_name")
+
+  local host_ip
+  host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  echo "Camera preview available at: http://127.0.0.1:${preview_port}/latest.jpg"
+  if [[ -n "$host_ip" ]]; then
+    echo "Also accessible on the local network at: http://${host_ip}:${preview_port}/latest.jpg"
+  fi
+  echo "Warning: the preview server is bound to 0.0.0.0 and may be reachable from the network. Use firewall rules or SSH port forwarding if you want to restrict access."
+
   local idx
   for ((idx = 1; idx <= camera_count; idx++)); do
     echo "Waiting for camera ${idx}/${camera_count} to appear..."
@@ -387,28 +411,9 @@ prompt_camera_enrollment() {
 
     echo "Detected camera ${idx}: ${detected_device}"
 
-    # Start a transient systemd preview service for this device so the user can inspect image
-    local preview_dir
-    preview_dir="$(mktemp -d)"
-    PREVIEW_DIRS+=("$preview_dir")
-    local preview_port=$((8080 + idx - 1))
-    local unit_name="hf-snapshot-preview-${RANDOM}-${idx}.service"
-
-    # Use the preview helper script from the repository and run it transiently via systemd
-    if [[ ! -x "$APP_DIR/preview.sh" ]]; then
-      echo "Preview helper $APP_DIR/preview.sh not found or not executable. Ensure the repository contains preview.sh" >&2
-      exit 1
-    fi
-    systemd-run --unit="$unit_name" --description="hf-snapshot preview ${detected_device}" /bin/bash "$APP_DIR/preview.sh" "${detected_device}" "$preview_port" "$preview_dir" >/dev/null 2>&1 || true
-    PREVIEW_UNITS+=("$unit_name")
-
-    # Determine a likely public IP for convenience (may be empty)
-    HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    echo "Preview for ${detected_device} available at: http://127.0.0.1:${preview_port}/latest.jpg"
-    if [[ -n "$HOST_IP" ]]; then
-      echo "Also accessible on the local network at: http://${HOST_IP}:${preview_port}/latest.jpg"
-    fi
-    echo "Warning: the preview server is bound to 0.0.0.0 and may be reachable from the network. Use firewall rules or SSH port forwarding if you want to restrict access."
+    # Switch preview input device without restarting the preview service.
+    printf '%s\n' "$detected_device" >"$preview_device_file"
+    echo "Preview switched to ${detected_device}: http://127.0.0.1:${preview_port}/latest.jpg"
 
     local camera_name
     while true; do
@@ -432,11 +437,6 @@ prompt_camera_enrollment() {
       echo "Invalid rotation; please enter one of: 0,90,180,270"
     done
 
-    # Stop the transient preview service and remove temp dir (cleanup will also run on exit)
-    systemctl stop "$unit_name" >/dev/null 2>&1 || true
-    systemctl reset-failed "$unit_name" >/dev/null 2>&1 || true
-    rm -rf "$preview_dir" || true
-
     CAMERA_DEVICES+=("$detected_device")
     CAMERA_NAMES+=("$camera_name")
     CAMERA_ROTATIONS+=("$rotation")
@@ -446,6 +446,10 @@ prompt_camera_enrollment() {
       prompt_input "Continue: " >/dev/null
     fi
   done
+
+  # Enrollment complete; stop preview service now.
+  systemctl stop "$preview_unit_name" >/dev/null 2>&1 || true
+  systemctl reset-failed "$preview_unit_name" >/dev/null 2>&1 || true
 }
 
 install_camera_config() {
