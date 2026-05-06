@@ -29,12 +29,15 @@ EXISTING_HF_TOKEN=""
 EXISTING_TELEGRAM_BOT_TOKEN=""
 EXISTING_TELEGRAM_CHAT_ID=""
 EXISTING_ENV_FOUND=0
+KEEP_EXISTING_HF_CONFIG=0
+KEEP_EXISTING_TELEGRAM_CONFIG=0
 
 EXISTING_CAMERAS_FOUND=0
 KEEP_EXISTING_CAMERA_CONFIG=0
 
 declare -a EXISTING_SNAPSHOT_TIMES=()
 EXISTING_SCHEDULE_FOUND=0
+KEEP_EXISTING_SCHEDULE=0
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -132,12 +135,15 @@ detect_existing_config() {
   EXISTING_TELEGRAM_BOT_TOKEN=""
   EXISTING_TELEGRAM_CHAT_ID=""
   EXISTING_ENV_FOUND=0
+  KEEP_EXISTING_HF_CONFIG=0
+  KEEP_EXISTING_TELEGRAM_CONFIG=0
 
   EXISTING_CAMERAS_FOUND=0
   KEEP_EXISTING_CAMERA_CONFIG=0
 
   EXISTING_SNAPSHOT_TIMES=()
   EXISTING_SCHEDULE_FOUND=0
+  KEEP_EXISTING_SCHEDULE=0
 
   if [[ -f "$ENV_FILE" ]]; then
     EXISTING_ENV_FOUND=1
@@ -225,6 +231,7 @@ prompt_hf_settings() {
     if prompt_default_yes "Existing Hugging Face configuration found for ${EXISTING_HF_REPO_ID}. Keep it"; then
       HF_REPO_ID="$EXISTING_HF_REPO_ID"
       HF_TOKEN="$EXISTING_HF_TOKEN"
+      KEEP_EXISTING_HF_CONFIG=1
       return
     fi
   fi
@@ -238,6 +245,7 @@ prompt_hf_settings() {
   while [[ -z "${HF_TOKEN}" ]]; do
     HF_TOKEN="$(prompt_secret "HF token cannot be empty. Enter HF access token: ")"
   done
+  KEEP_EXISTING_HF_CONFIG=0
 }
 
 prompt_telegram_settings() {
@@ -249,12 +257,14 @@ prompt_telegram_settings() {
     if prompt_default_yes "Existing Telegram configuration found. Keep it"; then
       TELEGRAM_BOT_TOKEN="$EXISTING_TELEGRAM_BOT_TOKEN"
       TELEGRAM_CHAT_ID="$EXISTING_TELEGRAM_CHAT_ID"
+      KEEP_EXISTING_TELEGRAM_CONFIG=1
       return
     fi
   fi
 
   TELEGRAM_BOT_TOKEN="$(prompt_secret "Telegram bot token (leave empty to skip): ")"
   TELEGRAM_CHAT_ID="$(prompt_input "Telegram chat ID (leave empty to skip): ")"
+  KEEP_EXISTING_TELEGRAM_CONFIG=0
 }
 
 list_persistent_camera_devices() {
@@ -533,6 +543,7 @@ prompt_snapshot_schedule() {
     existing_display="${existing_display%, }"
     if prompt_default_yes "Existing schedule found (${existing_display}). Keep it"; then
       SNAPSHOT_TIMES=("${EXISTING_SNAPSHOT_TIMES[@]}")
+      KEEP_EXISTING_SCHEDULE=1
       return
     fi
   fi
@@ -542,6 +553,7 @@ prompt_snapshot_schedule() {
 
   if [[ -z "$use_defaults" || "$use_defaults" =~ ^[Yy]$ ]]; then
     SNAPSHOT_TIMES=("06:00" "08:00" "10:00" "12:00" "14:00" "16:00" "18:00" "20:00" "22:00")
+    KEEP_EXISTING_SCHEDULE=0
     return
   fi
 
@@ -571,6 +583,7 @@ prompt_snapshot_schedule() {
       break
     fi
   done
+  KEEP_EXISTING_SCHEDULE=0
 }
 
 install_env_file() {
@@ -583,6 +596,7 @@ CAMERA_CONFIG_FILE=${CAMERA_CONFIG_FILE}
 FFMPEG_BINARY=ffmpeg
 FFMPEG_INPUT_FORMAT=mjpeg
 FFMPEG_VIDEO_SIZE=3840x2160
+CAPTURE_WARMUP_SECONDS=4.0
 UPLOAD_RETRY_COUNT=3
 UPLOAD_RETRY_DELAY_SECONDS=2.0
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -683,16 +697,44 @@ show_summary() {
   echo "Repository: $REPO_URL (branch: $REPO_BRANCH)"
   echo "Installed path: $APP_DIR"
   echo "Environment file: $ENV_FILE"
+
+  if [[ "$KEEP_EXISTING_HF_CONFIG" -eq 1 ]]; then
+    echo "Hugging Face config: kept existing (${HF_REPO_ID})"
+  else
+    echo "Hugging Face config: newly configured (${HF_REPO_ID})"
+  fi
+
+  if [[ "$KEEP_EXISTING_TELEGRAM_CONFIG" -eq 1 ]]; then
+    echo "Telegram config: kept existing"
+  elif [[ -n "$TELEGRAM_BOT_TOKEN" || -n "$TELEGRAM_CHAT_ID" ]]; then
+    echo "Telegram config: newly configured"
+  else
+    echo "Telegram config: disabled"
+  fi
+
   echo "Camera config file: $CAMERA_CONFIG_FILE"
-  echo "Configured cameras:"
+
+  if [[ "$KEEP_EXISTING_CAMERA_CONFIG" -eq 1 && -f "$CAMERA_CONFIG_FILE" ]]; then
+    echo "Camera config: kept existing"
+    cat "$CAMERA_CONFIG_FILE"
+  else
+    echo "Configured cameras:"
+    local idx
+    for idx in "${!CAMERA_DEVICES[@]}"; do
+      echo "  - ${CAMERA_NAMES[$idx]} -> ${CAMERA_DEVICES[$idx]}"
+    done
+  fi
+
+  if [[ "$KEEP_EXISTING_SCHEDULE" -eq 1 ]]; then
+    echo "Snapshot schedule: kept existing"
+  else
+    echo "Snapshot schedule:"
+  fi
   local idx
-  for idx in "${!CAMERA_DEVICES[@]}"; do
-    echo "  - ${CAMERA_NAMES[$idx]} -> ${CAMERA_DEVICES[$idx]}"
-  done
-  echo "Snapshot schedule:"
   for idx in "${!SNAPSHOT_TIMES[@]}"; do
     echo "  - ${SNAPSHOT_TIMES[$idx]}"
   done
+
   echo
   echo "Credentials were written to:"
   echo "  - $ENV_FILE"
