@@ -171,7 +171,7 @@ prompt_telegram_settings() {
   echo "You can provide a Telegram bot token and chat ID to receive error alerts."
   echo "Leave blank to skip Telegram alerts."
 
-  TELEGRAM_BOT_TOKEN="$(prompt_input "Telegram bot token (leave empty to skip): ")"
+  TELEGRAM_BOT_TOKEN="$(prompt_secret "Telegram bot token (leave empty to skip): ")"
   TELEGRAM_CHAT_ID="$(prompt_input "Telegram chat ID (leave empty to skip): ")"
 }
 
