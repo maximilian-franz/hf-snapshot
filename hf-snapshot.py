@@ -7,10 +7,11 @@ import os
 import subprocess
 import tempfile
 import time
+import requests
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, Optional
 
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, hf_hub_download
@@ -41,6 +42,8 @@ class Config:
     camera_config_file: Path
     upload_retry_count: int
     upload_retry_delay_seconds: float
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -82,7 +85,25 @@ def load_config() -> Config:
         upload_retry_delay_seconds=float(
             os.getenv("UPLOAD_RETRY_DELAY_SECONDS", "2.0")
         ),
+        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
+        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
     )
+
+
+def send_telegram_alert(bot_token: str, chat_id: str, message: str, logger: logging.Logger) -> None:
+    if not bot_token or not chat_id:
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message}
+        resp = requests.post(url, data=payload, timeout=10)
+        if resp.ok:
+            logger.info("Sent Telegram alert to chat_id %s", chat_id)
+        else:
+            logger.error("Telegram API returned %s: %s", resp.status_code, resp.text)
+    except Exception:
+        logger.exception("Failed to send Telegram alert")
 
 
 def load_camera_config(path: Path) -> list[CameraConfigRow]:
@@ -364,6 +385,15 @@ def main() -> int:
         logger.error("Run completed with failures during image upload:")
         for failure in failures:
             logger.error("  %s", failure)
+
+        # Send Telegram alert if configured
+        if config.telegram_bot_token and config.telegram_chat_id:
+            message_lines = ["hf-snapshot: upload run failed.", "Failures:"]
+            for failure in failures:
+                message_lines.append(f"- {failure}")
+            message = "\n".join(message_lines)
+            send_telegram_alert(config.telegram_bot_token, config.telegram_chat_id, message, logger)
+
         return 1
 
     updated_rows = merge_metadata_rows(existing_rows, records)

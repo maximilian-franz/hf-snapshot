@@ -4,6 +4,8 @@ set -euo pipefail
 APP_DIR="/opt/hf-snapshot"
 VENV_DIR="$APP_DIR/.venv"
 ENV_FILE="$APP_DIR/.env"
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
 
 SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_FILE="$APP_DIR/hf-snapshot.service"
@@ -139,6 +141,15 @@ prompt_hf_settings() {
   while [[ -z "${HF_TOKEN}" ]]; do
     HF_TOKEN="$(prompt_secret "HF token cannot be empty. Enter HF access token: ")"
   done
+}
+
+prompt_telegram_settings() {
+  echo "[3b/11] Optional: Telegram alerts"
+  echo "You can provide a Telegram bot token and chat ID to receive error alerts."
+  echo "Leave blank to skip Telegram alerts."
+
+  TELEGRAM_BOT_TOKEN="$(prompt_input "Telegram bot token (leave empty to skip): ")"
+  TELEGRAM_CHAT_ID="$(prompt_input "Telegram chat ID (leave empty to skip): ")"
 }
 
 list_persistent_camera_devices() {
@@ -386,6 +397,8 @@ FFMPEG_INPUT_FORMAT=mjpeg
 FFMPEG_VIDEO_SIZE=3840x2160
 UPLOAD_RETRY_COUNT=3
 UPLOAD_RETRY_DELAY_SECONDS=2.0
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 EOF
 
   chmod 640 "$ENV_FILE"
@@ -557,6 +570,7 @@ main() {
   install_packages
   fetch_repository
   prompt_hf_settings
+  prompt_telegram_settings
   prompt_camera_enrollment
   install_camera_config
   prompt_snapshot_schedule
