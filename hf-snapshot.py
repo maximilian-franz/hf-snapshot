@@ -345,6 +345,13 @@ def main() -> int:
     failures: list[str] = []
     records: list[SnapshotRecord] = []
 
+    api = HfApi(token=config.hf_token)
+    existing_rows = download_metadata_csv(
+        repo_id=config.hf_repo_id,
+        token=config.hf_token,
+        logger=logger,
+    )
+
     with tempfile.TemporaryDirectory(prefix="hf-snapshot-captures-") as tmpdir:
         capture_dir = Path(tmpdir)
         for camera in camera_configs:
@@ -374,71 +381,64 @@ def main() -> int:
                 )
             )
 
-    if not records:
-        logger.error("No snapshots were captured successfully.")
-        for failure in failures:
-            logger.error("  %s", failure)
-        return 1
-
-    api = HfApi(token=config.hf_token)
-    existing_rows = download_metadata_csv(
-        repo_id=config.hf_repo_id,
-        token=config.hf_token,
-        logger=logger,
-    )
-
-    for record in records:
-        try:
-            upload_file_with_retries(
-                api=api,
-                repo_id=config.hf_repo_id,
-                token=config.hf_token,
-                local_path=record.local_path,
-                remote_path=record.remote_path,
-                retry_count=config.upload_retry_count,
-                retry_delay_seconds=config.upload_retry_delay_seconds,
-                logger=logger,
-            )
-            logger.info("Uploaded %s -> %s.", record.local_path, record.remote_path)
-        except Exception as exc:
-            failures.append(f"{record.camera_id}: image upload failed: {exc}")
-
-    if failures:
-        logger.error("Run completed with failures during image upload:")
-        for failure in failures:
-            logger.error("  %s", failure)
-
-        # Send Telegram alert if configured
-        if config.telegram_bot_token and config.telegram_chat_id:
-            message_lines = ["hf-snapshot: upload run failed.", "Failures:"]
+        if not records:
+            logger.error("No snapshots were captured successfully.")
             for failure in failures:
-                message_lines.append(f"- {failure}")
-            message = "\n".join(message_lines)
-            send_telegram_alert(config.telegram_bot_token, config.telegram_chat_id, message, logger)
-
-        return 1
-
-    updated_rows = merge_metadata_rows(existing_rows, records)
-
-    with tempfile.TemporaryDirectory(prefix="hf-snapshot-metadata-") as tmpdir:
-        metadata_local_path = Path(tmpdir) / "metadata.csv"
-        write_metadata_csv(metadata_local_path, updated_rows)
-
-        try:
-            upload_file_with_retries(
-                api=api,
-                repo_id=config.hf_repo_id,
-                token=config.hf_token,
-                local_path=metadata_local_path,
-                remote_path="metadata.csv",
-                retry_count=config.upload_retry_count,
-                retry_delay_seconds=config.upload_retry_delay_seconds,
-                logger=logger,
-            )
-            logger.info("Uploaded updated metadata.csv.")
-        except Exception as exc:
-            logger.error("Metadata upload failed: %s", exc)
+                logger.error("  %s", failure)
             return 1
+
+        for record in records:
+            try:
+                upload_file_with_retries(
+                    api=api,
+                    repo_id=config.hf_repo_id,
+                    token=config.hf_token,
+                    local_path=record.local_path,
+                    remote_path=record.remote_path,
+                    retry_count=config.upload_retry_count,
+                    retry_delay_seconds=config.upload_retry_delay_seconds,
+                    logger=logger,
+                )
+                logger.info("Uploaded %s -> %s.", record.local_path, record.remote_path)
+            except Exception as exc:
+                failures.append(f"{record.camera_id}: image upload failed: {exc}")
+
+        if failures:
+            logger.error("Run completed with failures during image upload:")
+            for failure in failures:
+                logger.error("  %s", failure)
+
+            # Send Telegram alert if configured
+            if config.telegram_bot_token and config.telegram_chat_id:
+                message_lines = ["hf-snapshot: upload run failed.", "Failures:"]
+                for failure in failures:
+                    message_lines.append(f"- {failure}")
+                message = "\n".join(message_lines)
+                send_telegram_alert(config.telegram_bot_token, config.telegram_chat_id, message, logger)
+
+            return 1
+
+        updated_rows = merge_metadata_rows(existing_rows, records)
+
+        with tempfile.TemporaryDirectory(prefix="hf-snapshot-metadata-") as metadata_tmpdir:
+            metadata_local_path = Path(metadata_tmpdir) / "metadata.csv"
+            write_metadata_csv(metadata_local_path, updated_rows)
+
+            try:
+                upload_file_with_retries(
+                    api=api,
+                    repo_id=config.hf_repo_id,
+                    token=config.hf_token,
+                    local_path=metadata_local_path,
+                    remote_path="metadata.csv",
+                    retry_count=config.upload_retry_count,
+                    retry_delay_seconds=config.upload_retry_delay_seconds,
+                    logger=logger,
+                )
+                logger.info("Uploaded updated metadata.csv.")
+            except Exception as exc:
+                logger.error("Metadata upload failed: %s", exc)
+                return 1
 
     logger.info("Run completed successfully.")
     return 0
