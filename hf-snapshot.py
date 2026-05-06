@@ -27,6 +27,7 @@ METADATA_HEADERS = ["file_name", "camera_id", "timestamp"]
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
 FFMPEG_INPUT_FORMAT = os.getenv("FFMPEG_INPUT_FORMAT", "mjpeg")
 FFMPEG_VIDEO_SIZE = os.getenv("FFMPEG_VIDEO_SIZE", "3840x2160")
+CAPTURE_WARMUP_SECONDS = float(os.getenv("CAPTURE_WARMUP_SECONDS", "4.0"))
 
 
 class MetadataRow(TypedDict):
@@ -182,6 +183,26 @@ def load_camera_config(path: Path) -> list[CameraConfigRow]:
 
 
 def capture_snapshot(device: str, output: Path, rotation: int = 0) -> None:
+    if CAPTURE_WARMUP_SECONDS > 0:
+        warmup_cmd = [
+            FFMPEG_BINARY,
+            "-y",
+            "-f",
+            "v4l2",
+            "-input_format",
+            FFMPEG_INPUT_FORMAT,
+            "-video_size",
+            FFMPEG_VIDEO_SIZE,
+            "-i",
+            device,
+            "-t",
+            str(CAPTURE_WARMUP_SECONDS),
+            "-f",
+            "null",
+            "-",
+        ]
+        subprocess.run(warmup_cmd, check=True)
+
     cmd = [
         FFMPEG_BINARY,
         "-y",
