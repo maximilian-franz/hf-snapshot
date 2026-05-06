@@ -17,7 +17,10 @@ REPO_BRANCH="main"
 CAMERA_CONFIG_FILE="$APP_DIR/cameras.json"
 declare -a CAMERA_DEVICES=()
 declare -a CAMERA_NAMES=()
+declare -a CAMERA_ROTATIONS=()
 declare -a SNAPSHOT_TIMES=()
+declare -a PREVIEW_UNITS=()
+declare -a PREVIEW_DIRS=()
 UNINSTALL_MODE=0
 FORCE_UNINSTALL=0
 
@@ -35,6 +38,19 @@ require_tty() {
     exit 1
   fi
 }
+
+cleanup_previews() {
+  local u d
+  for u in "${PREVIEW_UNITS[@]}"; do
+    systemctl stop "$u" >/dev/null 2>&1 || true
+    systemctl reset-failed "$u" >/dev/null 2>&1 || true
+  done
+  for d in "${PREVIEW_DIRS[@]}"; do
+    rm -rf "$d" >/dev/null 2>&1 || true
+  done
+}
+
+trap cleanup_previews EXIT
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -115,6 +131,7 @@ fetch_repository() {
     "$APP_DIR/requirements.txt"
     "$APP_DIR/hf-snapshot.service"
     "$APP_DIR/hf-snapshot.timer"
+    "$APP_DIR/preview.sh"
   )
 
   local path
@@ -124,6 +141,12 @@ fetch_repository() {
       exit 1
     fi
   done
+
+  # Ensure preview helper is executable
+  if [[ -f "$APP_DIR/preview.sh" ]]; then
+    chmod 755 "$APP_DIR/preview.sh" || true
+    chown root:root "$APP_DIR/preview.sh" || true
+  fi
 }
 
 prompt_hf_settings() {
@@ -227,6 +250,17 @@ is_valid_camera_name() {
   [[ -n "$value" && "$value" != *"/"* && "$value" != *$'\t'* && "$value" != *$'\n'* ]]
 }
 
+is_valid_rotation() {
+  local v="$1"
+  if [[ -z "$v" ]]; then
+    return 0
+  fi
+  case "$v" in
+    0|90|180|270) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 prompt_camera_enrollment() {
   echo "[4/11] Camera enrollment"
   echo "Unplug every camera you want to configure, then connect them one at a time."
@@ -250,6 +284,7 @@ prompt_camera_enrollment() {
 
   CAMERA_DEVICES=()
   CAMERA_NAMES=()
+  CAMERA_ROTATIONS=()
 
   local idx
   for ((idx = 1; idx <= camera_count; idx++)); do
@@ -269,6 +304,24 @@ prompt_camera_enrollment() {
 
     echo "Detected camera ${idx}: ${detected_device}"
 
+    # Start a transient systemd preview service for this device so the user can inspect image
+    local preview_dir
+    preview_dir="$(mktemp -d)"
+    PREVIEW_DIRS+=("$preview_dir")
+    local preview_port=$((8080 + idx - 1))
+    local unit_name="hf-snapshot-preview-${RANDOM}-${idx}.service"
+
+    # Use the preview helper script from the repository and run it transiently via systemd
+    if [[ ! -x "$APP_DIR/preview.sh" ]]; then
+      echo "Preview helper $APP_DIR/preview.sh not found or not executable. Ensure the repository contains preview.sh" >&2
+      exit 1
+    fi
+    systemd-run --unit="$unit_name" --description="hf-snapshot preview ${detected_device}" /bin/bash "$APP_DIR/preview.sh" "${detected_device}" "$preview_port" "$preview_dir" >/dev/null 2>&1 || true
+    PREVIEW_UNITS+=("$unit_name")
+
+    echo "Preview for ${detected_device} available at: http://127.0.0.1:${preview_port}/latest.jpg"
+    echo "Open that URL on this machine (or use SSH port forwarding) to inspect the camera image."
+
     local camera_name
     while true; do
       camera_name="$(prompt_input "Label for ${detected_device}: ")"
@@ -279,8 +332,26 @@ prompt_camera_enrollment() {
       echo "Camera names must be non-empty and cannot contain '/', tabs, or newlines."
     done
 
+    local rotation
+    while true; do
+      rotation="$(prompt_input "Rotation for ${detected_device} in degrees (0,90,180,270) [default 0]: ")"
+      if [[ -z "$rotation" ]]; then
+        rotation=0
+      fi
+      if is_valid_rotation "$rotation"; then
+        break
+      fi
+      echo "Invalid rotation; please enter one of: 0,90,180,270"
+    done
+
+    # Stop the transient preview service and remove temp dir (cleanup will also run on exit)
+    systemctl stop "$unit_name" >/dev/null 2>&1 || true
+    systemctl reset-failed "$unit_name" >/dev/null 2>&1 || true
+    rm -rf "$preview_dir" || true
+
     CAMERA_DEVICES+=("$detected_device")
     CAMERA_NAMES+=("$camera_name")
+    CAMERA_ROTATIONS+=("$rotation")
 
     if [[ $idx -lt $camera_count ]]; then
       echo "Unplug ${detected_device}, then plug in the next camera and press Enter."
@@ -298,7 +369,7 @@ install_camera_config() {
   {
     local idx
     for idx in "${!CAMERA_DEVICES[@]}"; do
-      printf '%s\t%s\n' "${CAMERA_DEVICES[$idx]}" "${CAMERA_NAMES[$idx]}"
+      printf '%s\t%s\t%s\n' "${CAMERA_DEVICES[$idx]}" "${CAMERA_NAMES[$idx]}" "${CAMERA_ROTATIONS[$idx]}"
     done
   } >"$mapping_file"
 
@@ -313,8 +384,18 @@ mapping_path = Path(sys.argv[2])
 cameras = []
 with mapping_path.open("r", encoding="utf-8") as f:
     for line in f:
-        device_path, camera_name = line.rstrip("\n").split("\t", 1)
-        cameras.append({"device_path": device_path, "camera_name": camera_name})
+      parts = line.rstrip("\n").split("\t")
+      if len(parts) < 2:
+        continue
+      device_path = parts[0]
+      camera_name = parts[1]
+      rotation = 0
+      if len(parts) >= 3 and parts[2].strip() != "":
+        try:
+          rotation = int(parts[2])
+        except Exception:
+          rotation = 0
+      cameras.append({"device_path": device_path, "camera_name": camera_name, "rotation": rotation})
 
 config_path.write_text(
     json.dumps({"cameras": cameras}, indent=2) + "\n",

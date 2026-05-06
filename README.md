@@ -18,6 +18,18 @@ This project includes:
 6. Images are uploaded to your Hugging Face dataset.
 7. metadata.csv is updated in the same dataset.
 
+Preview & Rotation
+-------------------
+
+During interactive camera enrollment the installer provides a short-lived preview service for each camera so you can inspect the live image and choose a friendly name and rotation. The preview is served on `127.0.0.1` (port `8080` and subsequent ports if you enroll multiple cameras). If you are installing remotely, use SSH port forwarding to view the preview in your local browser.
+
+You can specify a rotation of `0`, `90`, `180`, or `270` degrees for each camera during enrollment. The installer records this rotation in `/opt/hf-snapshot/cameras.json` and the uploader will apply the rotation to captured snapshots using ffmpeg.
+
+Preview helper requirement
+--------------------------
+
+The installer requires a helper script `preview.sh` in the repository root. During installation the installer will make `preview.sh` executable (mode 755) and run it transiently via `systemd-run` to provide the live preview. Ensure your cloned repository includes `preview.sh` at the root; this file is included in the project and the installer will use it automatically.
+
 ## Requirements
 
 - Linux host with systemd

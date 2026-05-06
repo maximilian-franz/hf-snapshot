@@ -57,6 +57,7 @@ class SnapshotRecord:
 class CameraConfigRow(TypedDict):
     device_path: str
     camera_name: str
+    rotation: int
 
 
 def setup_logging() -> logging.Logger:
@@ -127,6 +128,7 @@ def load_camera_config(path: Path) -> list[CameraConfigRow]:
 
         device_path = camera.get("device_path")
         camera_name = camera.get("camera_name")
+        rotation_val = camera.get("rotation", 0)
 
         if not isinstance(device_path, str) or not device_path.strip():
             raise RuntimeError(f"Camera config entry {index} is missing device_path")
@@ -137,6 +139,14 @@ def load_camera_config(path: Path) -> list[CameraConfigRow]:
             raise RuntimeError(
                 f"Camera config entry {index} has invalid camera_name containing '/': {camera_name}"
             )
+
+        # normalize rotation
+        try:
+            rotation = int(rotation_val)
+        except Exception:
+            raise RuntimeError(f"Camera config entry {index} has invalid rotation: {rotation_val}")
+        if rotation not in (0, 90, 180, 270):
+            raise RuntimeError(f"Camera config entry {index} has unsupported rotation: {rotation}")
 
         resolved_device_path = Path(device_path)
         if not device_path.startswith("/dev/v4l/by-path/"):
@@ -164,13 +174,14 @@ def load_camera_config(path: Path) -> list[CameraConfigRow]:
             {
                 "device_path": device_path,
                 "camera_name": camera_name,
+                "rotation": rotation,
             }
         )
 
     return parsed_cameras
 
 
-def capture_snapshot(device: str, output: Path) -> None:
+def capture_snapshot(device: str, output: Path, rotation: int = 0) -> None:
     cmd = [
         FFMPEG_BINARY,
         "-y",
@@ -182,10 +193,20 @@ def capture_snapshot(device: str, output: Path) -> None:
         FFMPEG_VIDEO_SIZE,
         "-i",
         device,
-        "-frames:v",
-        "1",
-        str(output),
     ]
+
+    vf = None
+    if rotation == 90:
+        vf = "transpose=1"
+    elif rotation == 180:
+        vf = "transpose=1,transpose=1"
+    elif rotation == 270:
+        vf = "transpose=2"
+
+    if vf:
+        cmd.extend(["-vf", vf])
+
+    cmd.extend(["-frames:v", "1", str(output)])
     subprocess.run(cmd, check=True)
 
 
@@ -329,12 +350,13 @@ def main() -> int:
         for camera in camera_configs:
             camera_id = camera["camera_name"]
             device_path = Path(camera["device_path"])
+            rotation = int(camera.get("rotation", 0))
             capture_started_at = datetime.now().astimezone()
             output_name = f"{camera_id}-{capture_started_at.strftime('%Y-%m-%dT%H-%M-%S-%f')}.jpg"
             output_path = capture_dir / output_name
 
             try:
-                capture_snapshot(str(device_path), output_path)
+                capture_snapshot(str(device_path), output_path, rotation=rotation)
             except subprocess.CalledProcessError as exc:
                 logger.exception("ffmpeg capture failed for %s: %s", device_path, exc)
                 failures.append(f"{camera_id}: snapshot capture failed: {exc}")
