@@ -28,6 +28,8 @@ FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
 FFMPEG_INPUT_FORMAT = os.getenv("FFMPEG_INPUT_FORMAT", "mjpeg")
 FFMPEG_VIDEO_SIZE = os.getenv("FFMPEG_VIDEO_SIZE", "3840x2160")
 CAPTURE_WARMUP_SECONDS = float(os.getenv("CAPTURE_WARMUP_SECONDS", "4.0"))
+CAPTURE_RETRY_COUNT = int(os.getenv("CAPTURE_RETRY_COUNT", "3"))
+CAPTURE_RETRY_DELAY_SECONDS = float(os.getenv("CAPTURE_RETRY_DELAY_SECONDS", "2.0"))
 
 
 class MetadataRow(TypedDict):
@@ -211,8 +213,62 @@ def capture_snapshot(device: str, output: Path, rotation: int = 0) -> None:
     if vf_parts:
         cmd.extend(["-vf", ",".join(vf_parts), "-fps_mode", "vfr"])
 
-    cmd.extend(["-frames:v", "1", str(output)])
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    # Use the image2 muxer `-update 1` to write/overwrite a single image
+    # and add retry logic for transient device/driver errors.
+    cmd.extend(["-f", "image2", "-update", "1", "-frames:v", "1", str(output)])
+
+    logger = logging.getLogger("hf_snapshot")
+
+    transient_indicators = [
+        "Protocol error",
+        "Bad file descriptor",
+        "Nothing was written",
+        "Device or resource busy",
+        "No such device",
+        "Device not accepting",
+        "failed to resubmit",
+        "device descriptor read",
+        "unable to enumerate",
+    ]
+
+    last_exc: subprocess.CalledProcessError | None = None
+    for attempt in range(1, CAPTURE_RETRY_COUNT + 1):
+        try:
+            logger.debug("Running ffmpeg capture attempt %s/%s: %s", attempt, CAPTURE_RETRY_COUNT, " ".join(cmd))
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            last_exc = exc
+            stderr_text = (exc.stderr or "").strip()
+            stdout_text = (exc.stdout or "").strip()
+
+            # Decide whether this looks like a transient error we should retry.
+            should_retry = False
+            combined = f"{stderr_text}\n{stdout_text}".lower()
+            for token in transient_indicators:
+                if token.lower() in combined:
+                    should_retry = True
+                    break
+
+            if attempt < CAPTURE_RETRY_COUNT and should_retry:
+                backoff = CAPTURE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "Transient ffmpeg error on %s (attempt %s/%s): %s. Retrying in %.1f s",
+                    device,
+                    attempt,
+                    CAPTURE_RETRY_COUNT,
+                    stderr_text.splitlines()[-1] if stderr_text else repr(exc),
+                    backoff,
+                )
+                time.sleep(backoff)
+                continue
+
+            # Non-retryable or no attempts left: re-raise so caller can handle/log stderr.
+            raise
+
+    # If we fall out of loop, raise the last exception for the caller to handle.
+    if last_exc:
+        raise last_exc
 
 
 def upload_file_with_retries(
