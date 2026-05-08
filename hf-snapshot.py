@@ -212,7 +212,7 @@ def capture_snapshot(device: str, output: Path, rotation: int = 0) -> None:
         cmd.extend(["-vf", ",".join(vf_parts), "-fps_mode", "vfr"])
 
     cmd.extend(["-frames:v", "1", str(output)])
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
 def upload_file_with_retries(
@@ -371,7 +371,11 @@ def main() -> int:
                 capture_snapshot(str(device_path), output_path, rotation=rotation)
             except subprocess.CalledProcessError as exc:
                 logger.exception("ffmpeg capture failed for %s: %s", device_path, exc)
+                if exc.stderr:
+                    logger.error("ffmpeg stderr for %s:\n%s", camera_id, exc.stderr.strip())
                 failures.append(f"{camera_id}: snapshot capture failed: {exc}")
+                if exc.stderr:
+                    failures.append(f"{camera_id}: ffmpeg stderr:\n{exc.stderr.strip()}")
                 continue
             except FileNotFoundError as exc:
                 logger.exception("ffmpeg executable not found: %s", exc)
