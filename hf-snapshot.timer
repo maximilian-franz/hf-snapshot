@@ -6,9 +6,14 @@ Description=Run hf-snapshot capture/upload at specific times
 # During installation, install.sh rewrites OnCalendar entries based on
 # interactive HH:MM schedule times you provide.
 OnCalendar=*-*-* 06:00:00
+OnCalendar=*-*-* 08:00:00
+OnCalendar=*-*-* 10:00:00
+OnCalendar=*-*-* 12:00:00
 OnCalendar=*-*-* 14:00:00
+OnCalendar=*-*-* 16:00:00
+OnCalendar=*-*-* 18:00:00
+OnCalendar=*-*-* 20:00:00
 OnCalendar=*-*-* 22:00:00
-Persistent=true
 Unit=hf-snapshot.service
 
 [Install]
