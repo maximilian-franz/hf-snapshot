@@ -3,11 +3,13 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import sys
 import os
 import subprocess
 import tempfile
 import time
 import requests
+import io
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -64,12 +66,25 @@ class CameraConfigRow(TypedDict):
     rotation: int
 
 
-def setup_logging() -> logging.Logger:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    return logging.getLogger("hf_snapshot")
+def setup_logging() -> tuple[logging.Logger, io.StringIO]:
+    logger = logging.getLogger("hf_snapshot")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    # Console handler (goes to stderr / systemd journal)
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(console_handler)
+
+    # In-memory buffer so we can ship logs to Telegram at the end of a run.
+    buf = io.StringIO()
+    buf_handler = logging.StreamHandler(buf)
+    buf_handler.setLevel(logging.DEBUG)
+    buf_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(buf_handler)
+
+    return logger, buf
 
 
 def env_required(name: str) -> str:
@@ -111,7 +126,7 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str, logger: logg
         logger.exception("Failed to send Telegram alert")
 
 
-def load_camera_config(path: Path) -> list[CameraConfigRow]:
+def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigRow]:
     if not path.exists():
         raise RuntimeError(f"Camera config file does not exist: {path}")
 
@@ -157,10 +172,14 @@ def load_camera_config(path: Path) -> list[CameraConfigRow]:
             raise RuntimeError(
                 f"Camera config entry {index} must use a persistent /dev/v4l/by-path device path: {device_path}"
             )
+
         if not resolved_device_path.exists():
-            raise RuntimeError(
-                f"Camera config entry {index} points to a missing device path: {device_path}"
+            logger.error(
+                "Camera config entry %s points to a missing device path: %s; skipping",
+                index,
+                device_path,
             )
+            continue
 
         real_device_path = resolved_device_path.resolve()
         if not real_device_path.is_char_device():
@@ -185,7 +204,7 @@ def load_camera_config(path: Path) -> list[CameraConfigRow]:
     return parsed_cameras
 
 
-def capture_snapshot(device: str, output: Path, rotation: int = 0) -> None:
+def capture_snapshot(device: str, output: Path, rotation: int, logger: logging.Logger) -> None:
     cmd = [
         FFMPEG_BINARY,
         "-y",
@@ -218,7 +237,6 @@ def capture_snapshot(device: str, output: Path, rotation: int = 0) -> None:
     # and add retry logic for transient device/driver errors.
     cmd.extend(["-f", "image2", "-update", "1", "-frames:v", "1", str(output)])
 
-    logger = logging.getLogger("hf_snapshot")
 
     transient_indicators = [
         "Protocol error",
@@ -389,13 +407,15 @@ def merge_metadata_rows(
     return merged_rows
 
 
-def main() -> int:
-    logger = setup_logging()
+def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.StringIO] = None) -> int:
+    if logger is None or log_buffer is None:
+        logger, log_buffer = setup_logging()
+
     config = load_config()
 
     logger.info("Starting snapshot capture and publish run.")
 
-    camera_configs = load_camera_config(config.camera_config_file)
+    camera_configs = load_camera_config(config.camera_config_file, logger)
     logger.info(
         "Loaded camera config from %s with cameras: %s",
         config.camera_config_file,
@@ -425,7 +445,7 @@ def main() -> int:
             output_path = capture_dir / output_name
 
             try:
-                capture_snapshot(str(device_path), output_path, rotation=rotation)
+                capture_snapshot(str(device_path), output_path, rotation, logger)
             except subprocess.CalledProcessError as exc:
                 logger.exception("ffmpeg capture failed for %s: %s", device_path, exc)
                 if exc.stderr:
@@ -511,18 +531,22 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    logger = setup_logging()
+    logger, log_buffer = setup_logging()
     # Read Telegram config early so we can notify on any failure
     telegram_bot = os.getenv("TELEGRAM_BOT_TOKEN") or None
     telegram_chat = os.getenv("TELEGRAM_CHAT_ID") or None
 
     try:
-        exit_code = main()
+        exit_code = main(logger=logger, log_buffer=log_buffer)
     except Exception as exc:  # catch any uncaught exception
         tb = traceback.format_exc()
         logger.exception("Uncaught exception in hf-snapshot: %s", exc)
         if telegram_bot and telegram_chat:
-            message = f"hf-snapshot: uncaught exception:\n{tb}"
+            log_text = log_buffer.getvalue()
+            max_len = 3800
+            if len(log_text) > max_len:
+                log_text = "(...truncated...)\n" + log_text[-max_len:]
+            message = f"hf-snapshot: uncaught exception. Logs:\n{log_text}\n\nTraceback:\n{tb}"
             send_telegram_alert(telegram_bot, telegram_chat, message, logger)
         raise SystemExit(1)
     else:
@@ -530,6 +554,10 @@ if __name__ == "__main__":
         if exit_code != 0:
             logger.error("hf-snapshot exited with code %s", exit_code)
             if telegram_bot and telegram_chat:
-                message = f"hf-snapshot: run completed with exit code {exit_code}."
+                log_text = log_buffer.getvalue()
+                max_len = 3800
+                if len(log_text) > max_len:
+                    log_text = "(...truncated...)\n" + log_text[-max_len:]
+                message = f"hf-snapshot: run completed with exit code {exit_code}. Logs:\n{log_text}"
                 send_telegram_alert(telegram_bot, telegram_chat, message, logger)
         raise SystemExit(exit_code)
