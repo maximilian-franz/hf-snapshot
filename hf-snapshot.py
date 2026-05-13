@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, Optional
 import traceback
+import html
 
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, hf_hub_download
@@ -110,13 +111,21 @@ def load_config() -> Config:
     )
 
 
-def send_telegram_alert(bot_token: str, chat_id: str, message: str, logger: logging.Logger) -> None:
+def send_telegram_alert(
+    bot_token: str,
+    chat_id: str,
+    message: str,
+    logger: logging.Logger,
+    parse_mode: Optional[str] = None,
+) -> None:
     if not bot_token or not chat_id:
         return
 
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": message}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         resp = requests.post(url, data=payload, timeout=10)
         if resp.ok:
             logger.info("Sent Telegram alert to chat_id %s", chat_id)
@@ -546,8 +555,10 @@ if __name__ == "__main__":
             max_len = 3800
             if len(log_text) > max_len:
                 log_text = "(...truncated...)\n" + log_text[-max_len:]
-            message = f"hf-snapshot: uncaught exception. Logs:\n{log_text}\n\nTraceback:\n{tb}"
-            send_telegram_alert(telegram_bot, telegram_chat, message, logger)
+            # Escape for HTML and wrap in a preformatted block for readability
+            escaped = html.escape(log_text + "\n\nTraceback:\n" + tb)
+            message_html = f"<pre>{escaped}</pre>"
+            send_telegram_alert(telegram_bot, telegram_chat, message_html, logger, parse_mode="HTML")
         raise SystemExit(1)
     else:
         # If the program ended with a non-zero exit code, ensure we notify
@@ -558,6 +569,7 @@ if __name__ == "__main__":
                 max_len = 3800
                 if len(log_text) > max_len:
                     log_text = "(...truncated...)\n" + log_text[-max_len:]
-                message = f"hf-snapshot: run completed with exit code {exit_code}. Logs:\n{log_text}"
-                send_telegram_alert(telegram_bot, telegram_chat, message, logger)
+                escaped = html.escape(log_text)
+                message_html = f"<pre>hf-snapshot: run completed with exit code {exit_code}.\n\n{escaped}</pre>"
+                send_telegram_alert(telegram_bot, telegram_chat, message_html, logger, parse_mode="HTML")
         raise SystemExit(exit_code)
