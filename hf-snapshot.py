@@ -135,6 +135,62 @@ def send_telegram_alert(
         logger.exception("Failed to send Telegram alert")
 
 
+def send_telegram_alert_with_file(
+    bot_token: str,
+    chat_id: str,
+    message: str,
+    log_content: str,
+    logger: logging.Logger,
+) -> None:
+    if not bot_token or not chat_id:
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+        files = {
+            "document": ("logs.txt", log_content.encode("utf-8"), "text/plain"),
+        }
+        data = {
+            "chat_id": chat_id,
+            "caption": message,
+        }
+        resp = requests.post(url, files=files, data=data, timeout=30)
+        if resp.ok:
+            logger.info("Sent Telegram alert with log file to chat_id %s", chat_id)
+        else:
+            logger.error("Telegram API returned %s: %s", resp.status_code, resp.text)
+    except Exception:
+        logger.exception("Failed to send Telegram alert with file")
+
+
+def send_telegram_images(
+    bot_token: str,
+    chat_id: str,
+    images: list[tuple[str, bytes]],
+    logger: logging.Logger,
+) -> None:
+    """Send image previews to Telegram. images is a list of (camera_id, image_bytes) tuples."""
+    if not bot_token or not chat_id or not images:
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+        for camera_id, image_data in images:
+            files = {
+                "photo": ("snapshot.jpg", image_data, "image/jpeg"),
+            }
+            data = {
+                "chat_id": chat_id,
+                "caption": f"Camera: {camera_id}",
+            }
+            resp = requests.post(url, files=files, data=data, timeout=30)
+            if not resp.ok:
+                logger.error("Failed to send image for %s: %s %s", camera_id, resp.status_code, resp.text)
+        logger.info("Sent %d image previews to Telegram", len(images))
+    except Exception:
+        logger.exception("Failed to send Telegram image previews")
+
+
 def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigRow]:
     if not path.exists():
         raise RuntimeError(f"Camera config file does not exist: {path}")
@@ -416,7 +472,7 @@ def merge_metadata_rows(
     return merged_rows
 
 
-def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.StringIO] = None) -> int:
+def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.StringIO] = None) -> tuple[int, list[str], list[tuple[str, bytes]]]:
     if logger is None or log_buffer is None:
         logger, log_buffer = setup_logging()
 
@@ -435,6 +491,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
 
     failures: list[str] = []
     records: list[SnapshotRecord] = []
+    images_to_send: list[tuple[str, bytes]] = []
 
     api = HfApi(token=config.hf_token)
     existing_rows = download_metadata_csv(
@@ -465,7 +522,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
                 continue
             except FileNotFoundError as exc:
                 logger.exception("ffmpeg executable not found: %s", exc)
-                return 1
+                return 1, failures, images_to_send
 
             records.append(
                 SnapshotRecord(
@@ -480,7 +537,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
             logger.error("No snapshots were captured successfully.")
             for failure in failures:
                 logger.error("  %s", failure)
-            return 1
+            return 1, failures, images_to_send
 
         for record in records:
             try:
@@ -502,16 +559,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
             logger.error("Run completed with failures during image upload:")
             for failure in failures:
                 logger.error("  %s", failure)
-
-            # Send Telegram alert if configured
-            if config.telegram_bot_token and config.telegram_chat_id:
-                message_lines = ["hf-snapshot: upload run failed.", "Failures:"]
-                for failure in failures:
-                    message_lines.append(f"- {failure}")
-                message = "\n".join(message_lines)
-                send_telegram_alert(config.telegram_bot_token, config.telegram_chat_id, message, logger)
-
-            return 1
+            return 1, failures, images_to_send
 
         updated_rows = merge_metadata_rows(existing_rows, records)
 
@@ -533,10 +581,20 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
                 logger.info("Uploaded updated metadata.csv.")
             except Exception as exc:
                 logger.error("Metadata upload failed: %s", exc)
-                return 1
+                return 1, failures, images_to_send
+
+        # Read images into memory before temp directory cleanup (limit to first 5)
+        for record in records[:5]:
+            try:
+                if record.local_path.exists():
+                    with open(record.local_path, "rb") as f:
+                        image_data = f.read()
+                    images_to_send.append((record.camera_id, image_data))
+            except Exception as exc:
+                logger.warning("Failed to read image for preview: %s", exc)
 
     logger.info("Run completed successfully.")
-    return 0
+    return 0, failures, images_to_send
 
 
 if __name__ == "__main__":
@@ -545,31 +603,54 @@ if __name__ == "__main__":
     telegram_bot = os.getenv("TELEGRAM_BOT_TOKEN") or None
     telegram_chat = os.getenv("TELEGRAM_CHAT_ID") or None
 
+    exit_code = 0
+    failures: list[str] = []
+    images: list[tuple[str, bytes]] = []
+    exception_message = None
+
     try:
-        exit_code = main(logger=logger, log_buffer=log_buffer)
+        exit_code, failures, images = main(logger=logger, log_buffer=log_buffer)
     except Exception as exc:  # catch any uncaught exception
         tb = traceback.format_exc()
         logger.exception("Uncaught exception in hf-snapshot: %s", exc)
-        if telegram_bot and telegram_chat:
-            log_text = log_buffer.getvalue()
-            max_len = 3800
-            if len(log_text) > max_len:
-                log_text = "(...truncated...)\n" + log_text[-max_len:]
-            # Escape for HTML and wrap in a preformatted block for readability
-            escaped = html.escape(log_text + "\n\nTraceback:\n" + tb)
-            message_html = f"<pre>{escaped}</pre>"
-            send_telegram_alert(telegram_bot, telegram_chat, message_html, logger, parse_mode="HTML")
-        raise SystemExit(1)
-    else:
-        # If the program ended with a non-zero exit code, ensure we notify
-        if exit_code != 0:
-            logger.error("hf-snapshot exited with code %s", exit_code)
-            if telegram_bot and telegram_chat:
-                log_text = log_buffer.getvalue()
-                max_len = 3800
-                if len(log_text) > max_len:
-                    log_text = "(...truncated...)\n" + log_text[-max_len:]
-                escaped = html.escape(log_text)
-                message_html = f"<pre>hf-snapshot: run completed with exit code {exit_code}.\n\n{escaped}</pre>"
-                send_telegram_alert(telegram_bot, telegram_chat, message_html, logger, parse_mode="HTML")
-        raise SystemExit(exit_code)
+        # Only set exception_message if no earlier return happened
+        exit_code = 1
+        exception_message = f"Uncaught exception: {exc}\n\nTraceback:\n{tb}"
+
+    # Consolidate all information for Telegram alerts
+    if telegram_bot and telegram_chat:
+        log_text = log_buffer.getvalue()
+        assert not (exception_message and failures), "Exception and failures should not both be present"
+        
+        if exception_message:
+            # Exception: send message + log file
+            send_telegram_alert_with_file(
+                telegram_bot,
+                telegram_chat,
+                "⛔ Run did not complete",
+                log_text,
+                logger,
+            )
+        elif exit_code == 0:
+            # Success: send message + images (no log file)
+            send_telegram_alert(
+                telegram_bot,
+                telegram_chat,
+                "✅ Run completed successfully",
+                logger,
+            )
+            if images:
+                send_telegram_images(telegram_bot, telegram_chat, images, logger)
+        else:
+            # Failures: send message + log file + images
+            send_telegram_alert_with_file(
+                telegram_bot,
+                telegram_chat,
+                "⚠️ Run completed with errors",
+                log_text,
+                logger,
+            )
+            if images:
+                send_telegram_images(telegram_bot, telegram_chat, images, logger)
+
+    raise SystemExit(exit_code)
