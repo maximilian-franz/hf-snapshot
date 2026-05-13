@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, Optional
+import traceback
 
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, hf_hub_download
@@ -510,4 +511,25 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    logger = setup_logging()
+    # Read Telegram config early so we can notify on any failure
+    telegram_bot = os.getenv("TELEGRAM_BOT_TOKEN") or None
+    telegram_chat = os.getenv("TELEGRAM_CHAT_ID") or None
+
+    try:
+        exit_code = main()
+    except Exception as exc:  # catch any uncaught exception
+        tb = traceback.format_exc()
+        logger.exception("Uncaught exception in hf-snapshot: %s", exc)
+        if telegram_bot and telegram_chat:
+            message = f"hf-snapshot: uncaught exception:\n{tb}"
+            send_telegram_alert(telegram_bot, telegram_chat, message, logger)
+        raise SystemExit(1)
+    else:
+        # If the program ended with a non-zero exit code, ensure we notify
+        if exit_code != 0:
+            logger.error("hf-snapshot exited with code %s", exit_code)
+            if telegram_bot and telegram_chat:
+                message = f"hf-snapshot: run completed with exit code {exit_code}."
+                send_telegram_alert(telegram_bot, telegram_chat, message, logger)
+        raise SystemExit(exit_code)
