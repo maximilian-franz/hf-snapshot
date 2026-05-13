@@ -169,24 +169,36 @@ def send_telegram_images(
     images: list[tuple[str, bytes]],
     logger: logging.Logger,
 ) -> None:
-    """Send image previews to Telegram. images is a list of (camera_id, image_bytes) tuples."""
+    """Send image previews to Telegram as a single media group. images is a list of (camera_id, image_bytes) tuples."""
     if not bot_token or not chat_id or not images:
         return
 
     try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-        for camera_id, image_data in images:
-            files = {
-                "photo": ("snapshot.jpg", image_data, "image/jpeg"),
-            }
-            data = {
-                "chat_id": chat_id,
+        url = f"https://api.telegram.org/bot{bot_token}/sendMediaGroup"
+        
+        # Prepare media array and files for multipart upload
+        media = []
+        files = {}
+        
+        for idx, (camera_id, image_data) in enumerate(images[:10]):  # Telegram limit is 10 items per group
+            file_key = f"photo_{idx}"
+            media.append({
+                "type": "photo",
+                "media": f"attach://{file_key}",
                 "caption": f"Camera: {camera_id}",
-            }
-            resp = requests.post(url, files=files, data=data, timeout=30)
-            if not resp.ok:
-                logger.error("Failed to send image for %s: %s %s", camera_id, resp.status_code, resp.text)
-        logger.info("Sent %d image previews to Telegram", len(images))
+            })
+            files[file_key] = ("snapshot.jpg", image_data, "image/jpeg")
+        
+        data = {
+            "chat_id": chat_id,
+            "media": json.dumps(media),
+        }
+        
+        resp = requests.post(url, data=data, files=files, timeout=30)
+        if resp.ok:
+            logger.info("Sent %d image previews to Telegram as a single message", len(images))
+        else:
+            logger.error("Failed to send images: %s %s", resp.status_code, resp.text)
     except Exception:
         logger.exception("Failed to send Telegram image previews")
 
