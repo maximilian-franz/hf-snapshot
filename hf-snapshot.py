@@ -7,6 +7,7 @@ import sys
 import os
 import subprocess
 import tempfile
+import shutil
 import time
 import requests
 import io
@@ -15,7 +16,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, Optional
 import traceback
-import html
 
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, hf_hub_download
@@ -34,6 +34,23 @@ FFMPEG_VIDEO_SIZE = os.getenv("FFMPEG_VIDEO_SIZE", "3840x2160")
 CAPTURE_WARMUP_SECONDS = float(os.getenv("CAPTURE_WARMUP_SECONDS", "4.0"))
 CAPTURE_RETRY_COUNT = int(os.getenv("CAPTURE_RETRY_COUNT", "3"))
 CAPTURE_RETRY_DELAY_SECONDS = float(os.getenv("CAPTURE_RETRY_DELAY_SECONDS", "2.0"))
+
+TRANSIENT_ERROR_INDICATORS = [
+    "protocol error",
+    "bad file descriptor",
+    "nothing was written",
+    "device or resource busy",
+    "no such device",
+    "device not accepting",
+    "failed to resubmit",
+    "device descriptor read",
+    "unable to enumerate",
+]
+
+TELEGRAM_MAX_IMAGES_PER_GROUP = 10
+
+MAX_PREVIEW_IMAGE_EDGE = 640
+PREVIEW_IMAGE_QV = 8
 
 
 class MetadataRow(TypedDict):
@@ -72,13 +89,11 @@ def setup_logging() -> tuple[logging.Logger, io.StringIO]:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    # Console handler (goes to stderr / systemd journal)
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(console_handler)
 
-    # In-memory buffer so we can ship logs to Telegram at the end of a run.
     buf = io.StringIO()
     buf_handler = logging.StreamHandler(buf)
     buf_handler.setLevel(logging.DEBUG)
@@ -96,16 +111,25 @@ def env_required(name: str) -> str:
 
 
 def load_config() -> Config:
+    try:
+        upload_retry_count = int(os.getenv("UPLOAD_RETRY_COUNT", "3"))
+        upload_retry_delay = float(os.getenv("UPLOAD_RETRY_DELAY_SECONDS", "2.0"))
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid retry configuration: {exc}") from exc
+
+    if upload_retry_count <= 0:
+        raise RuntimeError("UPLOAD_RETRY_COUNT must be greater than 0")
+    if upload_retry_delay <= 0:
+        raise RuntimeError("UPLOAD_RETRY_DELAY_SECONDS must be greater than 0")
+    
     return Config(
         hf_token=env_required("HF_TOKEN"),
         hf_repo_id=env_required("HF_REPO_ID"),
         camera_config_file=Path(
             os.getenv("CAMERA_CONFIG_FILE", str(SCRIPT_DIR / "cameras.json"))
         ),
-        upload_retry_count=int(os.getenv("UPLOAD_RETRY_COUNT", "3")),
-        upload_retry_delay_seconds=float(
-            os.getenv("UPLOAD_RETRY_DELAY_SECONDS", "2.0")
-        ),
+        upload_retry_count=upload_retry_count,
+        upload_retry_delay_seconds=upload_retry_delay,
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
     )
@@ -131,8 +155,8 @@ def send_telegram_alert(
             logger.info("Sent Telegram alert to chat_id %s", chat_id)
         else:
             logger.error("Telegram API returned %s: %s", resp.status_code, resp.text)
-    except Exception:
-        logger.exception("Failed to send Telegram alert")
+    except requests.RequestException as exc:
+        logger.error("Failed to send Telegram alert: %s", exc)
 
 
 def send_telegram_alert_with_file(
@@ -159,8 +183,8 @@ def send_telegram_alert_with_file(
             logger.info("Sent Telegram alert with log file to chat_id %s", chat_id)
         else:
             logger.error("Telegram API returned %s: %s", resp.status_code, resp.text)
-    except Exception:
-        logger.exception("Failed to send Telegram alert with file")
+    except requests.RequestException as exc:
+        logger.error("Failed to send Telegram alert with file: %s", exc)
 
 
 def send_telegram_images(
@@ -169,41 +193,166 @@ def send_telegram_images(
     images: list[tuple[str, bytes]],
     logger: logging.Logger,
 ) -> None:
-    """Send image previews to Telegram as a single media group. images is a list of (camera_id, image_bytes) tuples."""
     if not bot_token or not chat_id or not images:
         return
 
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMediaGroup"
-        
-        # Prepare media array and files for multipart upload
+
         media = []
         files = {}
-        
-        for idx, (camera_id, image_data) in enumerate(images[:10]):  # Telegram limit is 10 items per group
-            file_key = f"photo_{idx}"
-            media.append({
-                "type": "photo",
-                "media": f"attach://{file_key}",
-                "caption": f"Camera: {camera_id}",
-            })
+        sent_count = 0
+
+        for camera_id, image_data in images:
+            if len(media) >= TELEGRAM_MAX_IMAGES_PER_GROUP:
+                break
+
+            file_key = f"photo_{len(media)}"
+            media.append(
+                {
+                    "type": "photo",
+                    "media": f"attach://{file_key}",
+                    "caption": f"Camera: {camera_id}",
+                }
+            )
             files[file_key] = ("snapshot.jpg", image_data, "image/jpeg")
-        
+            sent_count += 1
+
+        if not media:
+            logger.warning("No valid images to send to Telegram")
+            return
+
         data = {
             "chat_id": chat_id,
             "media": json.dumps(media),
         }
-        
+
         resp = requests.post(url, data=data, files=files, timeout=30)
         if resp.ok:
-            logger.info("Sent %d image previews to Telegram as a single message", len(images))
+            logger.info("Sent %d image previews to Telegram", sent_count)
         else:
             logger.error("Failed to send images: %s %s", resp.status_code, resp.text)
-    except Exception:
-        logger.exception("Failed to send Telegram image previews")
+    except requests.RequestException as exc:
+        logger.error("Failed to send Telegram image previews: %s", exc)
 
 
-def load_camera_config(path: Path, logger: logging.Logger) -> tuple[list[CameraConfigRow], list[str]]:
+def create_preview_image(image_path: Path, logger: logging.Logger) -> bytes | None:
+    try:
+        cmd = [
+            FFMPEG_BINARY,
+            "-y",
+            "-i",
+            str(image_path),
+            "-vf",
+            f"scale={MAX_PREVIEW_IMAGE_EDGE}:{MAX_PREVIEW_IMAGE_EDGE}:force_original_aspect_ratio=decrease:flags=lanczos",
+            "-frames:v",
+            "1",
+            "-q:v",
+            str(PREVIEW_IMAGE_QV),
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ]
+
+        result = subprocess.run(cmd, check=True, capture_output=True)
+        return result.stdout
+    except subprocess.CalledProcessError as exc:
+        stderr_text = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        logger.warning("Failed to create preview for %s: %s", image_path, stderr_text or exc)
+        return None
+    except FileNotFoundError as exc:
+        logger.warning("Failed to create preview for %s: %s", image_path, exc)
+        return None
+
+
+def create_previews_batch(
+    records: list[SnapshotRecord], logger: logging.Logger, max_count: int = 5
+) -> list[tuple[str, bytes]]:
+    images: list[tuple[str, bytes]] = []
+    selected = [r for r in records if r.local_path.exists()][:max_count]
+    if not selected:
+        return images
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="hf-snapshot-preview-src-") as src_tmp, tempfile.TemporaryDirectory(prefix="hf-snapshot-preview-out-") as out_tmp:
+            src = Path(src_tmp)
+            out = Path(out_tmp)
+
+            # Stage numbered inputs (img000001.jpg ...)
+            for idx, rec in enumerate(selected, start=1):
+                name = f"img{idx:06d}.jpg"
+                target = src / name
+                try:
+                    os.symlink(rec.local_path, target)
+                except Exception:
+                    try:
+                        shutil.copy2(rec.local_path, target)
+                    except Exception as exc:
+                        logger.warning("Failed to stage preview source for %s: %s", rec.local_path, exc)
+
+            cmd = [
+                FFMPEG_BINARY,
+                "-y",
+                "-i",
+                str(src / "img%06d.jpg"),
+                "-vf",
+                f"scale={MAX_PREVIEW_IMAGE_EDGE}:{MAX_PREVIEW_IMAGE_EDGE}:force_original_aspect_ratio=decrease:flags=lanczos",
+                "-q:v",
+                str(PREVIEW_IMAGE_QV),
+                str(out / "preview_%06d.jpg"),
+            ]
+
+            try:
+                logger.debug("Running batched ffmpeg for %d previews", len(selected))
+                subprocess.run(cmd, check=True, capture_output=True)
+
+                # Read generated previews and map back to camera IDs
+                for idx, rec in enumerate(selected, start=1):
+                    preview_file = out / f"preview_{idx:06d}.jpg"
+                    if preview_file.exists():
+                        try:
+                            data = preview_file.read_bytes()
+                            images.append((rec.camera_id, data))
+                        except Exception as exc:
+                            logger.warning("Failed to read generated preview %s: %s", preview_file, exc)
+                    else:
+                        logger.warning("Expected preview not found: %s", preview_file)
+
+                return images
+            except subprocess.CalledProcessError as exc:
+                stderr_text = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+                logger.warning("Batched ffmpeg preview generation failed: %s", stderr_text or exc)
+                # fall back to per-image preview creation
+    except Exception as exc:
+        logger.warning("Failed to run batched preview generation: %s", exc)
+
+    # Fallback: create previews one-by-one
+    for rec in selected:
+        try:
+            preview_data = create_preview_image(rec.local_path, logger)
+            if preview_data is not None:
+                images.append((rec.camera_id, preview_data))
+        except Exception as exc:
+            logger.warning("Per-image preview fallback failed for %s: %s", rec.local_path, exc)
+
+    return images
+
+
+def _ffmpeg_available(logger: logging.Logger) -> bool:
+    try:
+        subprocess.run([FFMPEG_BINARY, "-version"], check=True, capture_output=True)
+        return True
+    except FileNotFoundError:
+        logger.error("ffmpeg not found: %s. Please install ffmpeg or set FFMPEG_BINARY.", FFMPEG_BINARY)
+        return False
+    except subprocess.CalledProcessError as exc:
+        logger.warning("ffmpeg exists but returned non-zero on -version: %s", (exc.stderr or b"").decode("utf-8", errors="replace"))
+        return True
+
+
+def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigRow]:
     if not path.exists():
         raise RuntimeError(f"Camera config file does not exist: {path}")
 
@@ -215,7 +364,6 @@ def load_camera_config(path: Path, logger: logging.Logger) -> tuple[list[CameraC
         raise RuntimeError(f"Camera config file has no cameras: {path}")
 
     parsed_cameras: list[CameraConfigRow] = []
-    skipped_cameras: list[str] = []
     seen_device_paths: set[str] = set()
     seen_camera_names: set[str] = set()
 
@@ -237,7 +385,6 @@ def load_camera_config(path: Path, logger: logging.Logger) -> tuple[list[CameraC
                 f"Camera config entry {index} has invalid camera_name containing '/': {camera_name}"
             )
 
-        # normalize rotation
         try:
             rotation = int(rotation_val)
         except Exception:
@@ -252,12 +399,7 @@ def load_camera_config(path: Path, logger: logging.Logger) -> tuple[list[CameraC
             )
 
         if not resolved_device_path.exists():
-            logger.error(
-                "Camera config entry %s points to a missing device path: %s; skipping",
-                index,
-                device_path,
-            )
-            skipped_cameras.append(f"{camera_name}: device not found at startup: {device_path}")
+            logger.error("Skipped camera config entry %s: device not found at startup: %s", index, device_path)
             continue
 
         real_device_path = resolved_device_path.resolve()
@@ -280,7 +422,7 @@ def load_camera_config(path: Path, logger: logging.Logger) -> tuple[list[CameraC
             }
         )
 
-    return parsed_cameras, skipped_cameras
+    return parsed_cameras
 
 
 def capture_snapshot(device: str, output: Path, rotation: int, logger: logging.Logger) -> None:
@@ -312,22 +454,7 @@ def capture_snapshot(device: str, output: Path, rotation: int, logger: logging.L
     if vf_parts:
         cmd.extend(["-vf", ",".join(vf_parts), "-fps_mode", "vfr"])
 
-    # Use the image2 muxer `-update 1` to write/overwrite a single image
-    # and add retry logic for transient device/driver errors.
     cmd.extend(["-f", "image2", "-update", "1", "-frames:v", "1", str(output)])
-
-
-    transient_indicators = [
-        "Protocol error",
-        "Bad file descriptor",
-        "Nothing was written",
-        "Device or resource busy",
-        "No such device",
-        "Device not accepting",
-        "failed to resubmit",
-        "device descriptor read",
-        "unable to enumerate",
-    ]
 
     last_exc: subprocess.CalledProcessError | None = None
     for attempt in range(1, CAPTURE_RETRY_COUNT + 1):
@@ -338,15 +465,9 @@ def capture_snapshot(device: str, output: Path, rotation: int, logger: logging.L
         except subprocess.CalledProcessError as exc:
             last_exc = exc
             stderr_text = (exc.stderr or "").strip()
-            stdout_text = (exc.stdout or "").strip()
 
-            # Decide whether this looks like a transient error we should retry.
-            should_retry = False
-            combined = f"{stderr_text}\n{stdout_text}".lower()
-            for token in transient_indicators:
-                if token.lower() in combined:
-                    should_retry = True
-                    break
+            combined_lower = f"{stderr_text}\n{exc.stdout or ''}".lower()
+            should_retry = any(token in combined_lower for token in TRANSIENT_ERROR_INDICATORS)
 
             if attempt < CAPTURE_RETRY_COUNT and should_retry:
                 backoff = CAPTURE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
@@ -361,10 +482,8 @@ def capture_snapshot(device: str, output: Path, rotation: int, logger: logging.L
                 time.sleep(backoff)
                 continue
 
-            # Non-retryable or no attempts left: re-raise so caller can handle/log stderr.
             raise
 
-    # If we fall out of loop, raise the last exception for the caller to handle.
     if last_exc:
         raise last_exc
 
@@ -432,27 +551,34 @@ def download_metadata_csv(
             token=token,
         )
     except EntryNotFoundError:
-        logger.info(
-            "Remote metadata.csv not found yet. Starting with an empty metadata table."
-        )
+        logger.info("Remote metadata.csv not found yet. Starting with an empty metadata table.")
         return []
 
     rows: list[MetadataRow] = []
-    with open(metadata_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(
-                {
-                    "file_name": row["file_name"],
-                    "camera_id": row["camera_id"],
-                    "timestamp": row["timestamp"],
-                }
-            )
+    try:
+        with open(metadata_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(
+                    {
+                        "file_name": row["file_name"],
+                        "camera_id": row["camera_id"],
+                        "timestamp": row["timestamp"],
+                    }
+                )
+    except (KeyError, csv.Error, ValueError) as exc:
+        logger.warning("Failed to parse remote metadata.csv; starting with empty table: %s", exc)
+        return []
+    
     return rows
 
 
 def write_metadata_csv(path: Path, rows: list[MetadataRow]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Failed to create directory for metadata file: {exc}")
+    
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=METADATA_HEADERS)
         writer.writeheader()
@@ -477,7 +603,6 @@ def merge_metadata_rows(
 
         existing_index = file_name_to_index.get(row["file_name"])
         if existing_index is not None:
-            # Keep row ordering stable while refreshing data for duplicate keys.
             merged_rows[existing_index] = row
         else:
             file_name_to_index[row["file_name"]] = len(merged_rows)
@@ -494,7 +619,10 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
 
     logger.info("Starting snapshot capture and publish run.")
 
-    camera_configs, skipped_cameras = load_camera_config(config.camera_config_file, logger)
+    if not _ffmpeg_available(logger):
+        return 1, images
+
+    camera_configs = load_camera_config(config.camera_config_file, logger)
     logger.info(
         "Loaded camera config from %s with cameras: %s",
         config.camera_config_file,
@@ -513,10 +641,6 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
         logger=logger,
     )
 
-    # Log skipped cameras so they appear in telegram notifications (via log_buffer)
-    for skipped in skipped_cameras:
-        logger.error("  %s", skipped)
-
     with tempfile.TemporaryDirectory(prefix="hf-snapshot-captures-") as tmpdir:
         capture_dir = Path(tmpdir)
         for camera in camera_configs:
@@ -530,7 +654,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
             try:
                 capture_snapshot(str(device_path), output_path, rotation, logger)
             except subprocess.CalledProcessError as exc:
-                logger.exception("ffmpeg capture failed for %s: %s", device_path, exc)
+                logger.error("ffmpeg capture failed for %s after %d attempts", device_path, CAPTURE_RETRY_COUNT)
                 if exc.stderr:
                     logger.error("ffmpeg stderr for %s:\n%s", camera_id, exc.stderr.strip())
                 continue
@@ -551,6 +675,8 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
             logger.error("No snapshots were captured successfully.")
             return 1, images_to_send
 
+        images_to_send = create_previews_batch(records, logger, max_count=TELEGRAM_MAX_IMAGES_PER_GROUP)
+
         for record in records:
             try:
                 upload_file_with_retries(
@@ -564,10 +690,9 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
                     logger=logger,
                 )
                 logger.info("Uploaded %s -> %s.", record.local_path, record.remote_path)
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
                 logger.error("Image upload failed for %s: %s", record.camera_id, exc)
 
-        # Write metadata for successfully captured images even if some captures failed.
         if records:
             updated_rows = merge_metadata_rows(existing_rows, records)
 
@@ -591,23 +716,12 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
                     logger.error("Metadata upload failed: %s", exc)
                     return 1, images_to_send
 
-        # Read images into memory before temp directory cleanup (limit to first 5)
-        for record in records[:5]:
-            try:
-                if record.local_path.exists():
-                    with open(record.local_path, "rb") as f:
-                        image_data = f.read()
-                    images_to_send.append((record.camera_id, image_data))
-            except Exception as exc:
-                logger.warning("Failed to read image for preview: %s", exc)
-
     logger.info("Run completed successfully.")
     return 0, images_to_send
 
 
 if __name__ == "__main__":
     logger, log_buffer = setup_logging()
-    # Read Telegram config early so we can notify on any failure
     telegram_bot = os.getenv("TELEGRAM_BOT_TOKEN") or None
     telegram_chat = os.getenv("TELEGRAM_CHAT_ID") or None
 
@@ -617,19 +731,16 @@ if __name__ == "__main__":
 
     try:
         exit_code, images = main(logger=logger, log_buffer=log_buffer)
-    except Exception as exc:  # catch any uncaught exception
+    except Exception as exc:
         tb = traceback.format_exc()
         logger.exception("Uncaught exception in hf-snapshot: %s", exc)
-        # Only set exception_message if no earlier return happened
         exit_code = 1
         exception_message = f"Uncaught exception: {exc}\n\nTraceback:\n{tb}"
 
-    # Consolidate all information for Telegram alerts
     if telegram_bot and telegram_chat:
         log_text = log_buffer.getvalue()
-        
+
         if exception_message:
-            # Exception: send message + log file
             send_telegram_alert_with_file(
                 telegram_bot,
                 telegram_chat,
@@ -637,18 +748,16 @@ if __name__ == "__main__":
                 log_text,
                 logger,
             )
-        elif exit_code == 0:
-            # Success: send message + images (no log file)
+            raise SystemExit(exit_code)
+
+        if exit_code == 0:
             send_telegram_alert(
                 telegram_bot,
                 telegram_chat,
                 "✅ Run completed successfully",
                 logger,
             )
-            if images:
-                send_telegram_images(telegram_bot, telegram_chat, images, logger)
         else:
-            # Failures: send message + log file + images
             send_telegram_alert_with_file(
                 telegram_bot,
                 telegram_chat,
@@ -656,7 +765,8 @@ if __name__ == "__main__":
                 log_text,
                 logger,
             )
-            if images:
-                send_telegram_images(telegram_bot, telegram_chat, images, logger)
+
+        if images:
+            send_telegram_images(telegram_bot, telegram_chat, images, logger)
 
     raise SystemExit(exit_code)
