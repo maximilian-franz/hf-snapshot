@@ -203,7 +203,7 @@ def send_telegram_images(
         logger.exception("Failed to send Telegram image previews")
 
 
-def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigRow]:
+def load_camera_config(path: Path, logger: logging.Logger) -> tuple[list[CameraConfigRow], list[str]]:
     if not path.exists():
         raise RuntimeError(f"Camera config file does not exist: {path}")
 
@@ -215,6 +215,7 @@ def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigR
         raise RuntimeError(f"Camera config file has no cameras: {path}")
 
     parsed_cameras: list[CameraConfigRow] = []
+    skipped_cameras: list[str] = []
     seen_device_paths: set[str] = set()
     seen_camera_names: set[str] = set()
 
@@ -256,6 +257,7 @@ def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigR
                 index,
                 device_path,
             )
+            skipped_cameras.append(f"{camera_name}: device not found at startup: {device_path}")
             continue
 
         real_device_path = resolved_device_path.resolve()
@@ -278,7 +280,7 @@ def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigR
             }
         )
 
-    return parsed_cameras
+    return parsed_cameras, skipped_cameras
 
 
 def capture_snapshot(device: str, output: Path, rotation: int, logger: logging.Logger) -> None:
@@ -484,7 +486,7 @@ def merge_metadata_rows(
     return merged_rows
 
 
-def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.StringIO] = None) -> tuple[int, list[str], list[tuple[str, bytes]]]:
+def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.StringIO] = None) -> tuple[int, list[tuple[str, bytes]]]:
     if logger is None or log_buffer is None:
         logger, log_buffer = setup_logging()
 
@@ -492,7 +494,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
 
     logger.info("Starting snapshot capture and publish run.")
 
-    camera_configs = load_camera_config(config.camera_config_file, logger)
+    camera_configs, skipped_cameras = load_camera_config(config.camera_config_file, logger)
     logger.info(
         "Loaded camera config from %s with cameras: %s",
         config.camera_config_file,
@@ -501,7 +503,6 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
         ),
     )
 
-    failures: list[str] = []
     records: list[SnapshotRecord] = []
     images_to_send: list[tuple[str, bytes]] = []
 
@@ -511,6 +512,10 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
         token=config.hf_token,
         logger=logger,
     )
+
+    # Log skipped cameras so they appear in telegram notifications (via log_buffer)
+    for skipped in skipped_cameras:
+        logger.error("  %s", skipped)
 
     with tempfile.TemporaryDirectory(prefix="hf-snapshot-captures-") as tmpdir:
         capture_dir = Path(tmpdir)
@@ -528,13 +533,10 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
                 logger.exception("ffmpeg capture failed for %s: %s", device_path, exc)
                 if exc.stderr:
                     logger.error("ffmpeg stderr for %s:\n%s", camera_id, exc.stderr.strip())
-                failures.append(f"{camera_id}: snapshot capture failed: {exc}")
-                if exc.stderr:
-                    failures.append(f"{camera_id}: ffmpeg stderr:\n{exc.stderr.strip()}")
                 continue
             except FileNotFoundError as exc:
                 logger.exception("ffmpeg executable not found: %s", exc)
-                return 1, failures, images_to_send
+                return 1, images_to_send
 
             records.append(
                 SnapshotRecord(
@@ -547,9 +549,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
 
         if not records:
             logger.error("No snapshots were captured successfully.")
-            for failure in failures:
-                logger.error("  %s", failure)
-            return 1, failures, images_to_send
+            return 1, images_to_send
 
         for record in records:
             try:
@@ -565,35 +565,31 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
                 )
                 logger.info("Uploaded %s -> %s.", record.local_path, record.remote_path)
             except Exception as exc:
-                failures.append(f"{record.camera_id}: image upload failed: {exc}")
+                logger.error("Image upload failed for %s: %s", record.camera_id, exc)
 
-        if failures:
-            logger.error("Run completed with failures during image upload:")
-            for failure in failures:
-                logger.error("  %s", failure)
-            return 1, failures, images_to_send
+        # Write metadata for successfully captured images even if some captures failed.
+        if records:
+            updated_rows = merge_metadata_rows(existing_rows, records)
 
-        updated_rows = merge_metadata_rows(existing_rows, records)
+            with tempfile.TemporaryDirectory(prefix="hf-snapshot-metadata-") as metadata_tmpdir:
+                metadata_local_path = Path(metadata_tmpdir) / "metadata.csv"
+                write_metadata_csv(metadata_local_path, updated_rows)
 
-        with tempfile.TemporaryDirectory(prefix="hf-snapshot-metadata-") as metadata_tmpdir:
-            metadata_local_path = Path(metadata_tmpdir) / "metadata.csv"
-            write_metadata_csv(metadata_local_path, updated_rows)
-
-            try:
-                upload_file_with_retries(
-                    api=api,
-                    repo_id=config.hf_repo_id,
-                    token=config.hf_token,
-                    local_path=metadata_local_path,
-                    remote_path="metadata.csv",
-                    retry_count=config.upload_retry_count,
-                    retry_delay_seconds=config.upload_retry_delay_seconds,
-                    logger=logger,
-                )
-                logger.info("Uploaded updated metadata.csv.")
-            except Exception as exc:
-                logger.error("Metadata upload failed: %s", exc)
-                return 1, failures, images_to_send
+                try:
+                    upload_file_with_retries(
+                        api=api,
+                        repo_id=config.hf_repo_id,
+                        token=config.hf_token,
+                        local_path=metadata_local_path,
+                        remote_path="metadata.csv",
+                        retry_count=config.upload_retry_count,
+                        retry_delay_seconds=config.upload_retry_delay_seconds,
+                        logger=logger,
+                    )
+                    logger.info("Uploaded updated metadata.csv.")
+                except Exception as exc:
+                    logger.error("Metadata upload failed: %s", exc)
+                    return 1, images_to_send
 
         # Read images into memory before temp directory cleanup (limit to first 5)
         for record in records[:5]:
@@ -606,7 +602,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
                 logger.warning("Failed to read image for preview: %s", exc)
 
     logger.info("Run completed successfully.")
-    return 0, failures, images_to_send
+    return 0, images_to_send
 
 
 if __name__ == "__main__":
@@ -616,12 +612,11 @@ if __name__ == "__main__":
     telegram_chat = os.getenv("TELEGRAM_CHAT_ID") or None
 
     exit_code = 0
-    failures: list[str] = []
     images: list[tuple[str, bytes]] = []
     exception_message = None
 
     try:
-        exit_code, failures, images = main(logger=logger, log_buffer=log_buffer)
+        exit_code, images = main(logger=logger, log_buffer=log_buffer)
     except Exception as exc:  # catch any uncaught exception
         tb = traceback.format_exc()
         logger.exception("Uncaught exception in hf-snapshot: %s", exc)
@@ -632,7 +627,6 @@ if __name__ == "__main__":
     # Consolidate all information for Telegram alerts
     if telegram_bot and telegram_chat:
         log_text = log_buffer.getvalue()
-        assert not (exception_message and failures), "Exception and failures should not both be present"
         
         if exception_message:
             # Exception: send message + log file
