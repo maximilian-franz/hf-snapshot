@@ -256,7 +256,7 @@ def create_preview_image(image_path: Path, logger: logging.Logger) -> bytes | No
             "pipe:1",
         ]
 
-        result = subprocess.run(cmd, check=True, capture_output=True)
+        result = subprocess.run(cmd, check=True, capture_output=True, timeout=30)
         return result.stdout
     except subprocess.CalledProcessError as exc:
         stderr_text = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
@@ -306,7 +306,7 @@ def create_previews_batch(
 
             try:
                 logger.debug("Running batched ffmpeg for %d previews", len(selected))
-                subprocess.run(cmd, check=True, capture_output=True)
+                subprocess.run(cmd, check=True, capture_output=True, timeout=30)
 
                 # Read generated previews and map back to camera IDs
                 for idx, rec in enumerate(selected, start=1):
@@ -342,7 +342,7 @@ def create_previews_batch(
 
 def _ffmpeg_available(logger: logging.Logger) -> bool:
     try:
-        subprocess.run([FFMPEG_BINARY, "-version"], check=True, capture_output=True)
+        subprocess.run([FFMPEG_BINARY, "-version"], check=True, capture_output=True, timeout=10)
         return True
     except FileNotFoundError:
         logger.error("ffmpeg not found: %s. Please install ffmpeg or set FFMPEG_BINARY.", FFMPEG_BINARY)
@@ -460,8 +460,23 @@ def capture_snapshot(device: str, output: Path, rotation: int, logger: logging.L
     for attempt in range(1, CAPTURE_RETRY_COUNT + 1):
         try:
             logger.debug("Running ffmpeg capture attempt %s/%s: %s", attempt, CAPTURE_RETRY_COUNT, " ".join(cmd))
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
             return
+        except subprocess.TimeoutExpired:
+            last_exc = None
+            if attempt < CAPTURE_RETRY_COUNT:
+                backoff = CAPTURE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "ffmpeg capture timeout on %s (attempt %s/%s). Retrying in %.1f s",
+                    device,
+                    attempt,
+                    CAPTURE_RETRY_COUNT,
+                    backoff,
+                )
+                time.sleep(backoff)
+                continue
+            else:
+                raise subprocess.CalledProcessError(1, cmd, stderr="ffmpeg capture timeout")
         except subprocess.CalledProcessError as exc:
             last_exc = exc
             stderr_text = (exc.stderr or "").strip()
