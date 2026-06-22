@@ -12,7 +12,7 @@ This project includes:
 
 1. The installer asks you to unplug all cameras you want to enroll.
 2. You plug cameras in one at a time, and the installer detects each persistent `/dev/v4l/by-path` device as it appears.
-3. You assign a name to each camera during installation.
+3. You assign a name and tower ID to each camera during installation.
 4. The installer writes a small camera mapping file in /opt/hf-snapshot.
 5. ffmpeg captures one snapshot per configured camera into a temporary workspace.
 6. Images are uploaded to your Hugging Face dataset.
@@ -24,6 +24,11 @@ Preview & Rotation
 During interactive camera enrollment the installer provides a short-lived preview service for each camera so you can inspect the live image and choose a friendly name and rotation. The preview is served on `127.0.0.1` (port `8080` and subsequent ports if you enroll multiple cameras). If you are installing remotely, use SSH port forwarding to view the preview in your local browser.
 
 You can specify a rotation of `0`, `90`, `180`, or `270` degrees for each camera during enrollment. The installer records this rotation in `/opt/hf-snapshot/cameras.json` and the uploader will apply the rotation to captured snapshots using ffmpeg.
+
+Tower ID
+--------
+
+Each camera must be assigned a tower ID during enrollment. This associates a camera with a physical deployment location (e.g. a monitoring tower or site). The tower ID is stored in `cameras.json` and included as a `tower_id` column in `metadata.csv` in the Hugging Face dataset.
 
 Preview helper requirement
 --------------------------
@@ -56,7 +61,7 @@ What the installer does:
 2. Clones or updates this repository to /opt/hf-snapshot.
 3. Prompts for Hugging Face repo ID and token.
 4. Prompts you to unplug all cameras, then connect them one at a time.
-5. Detects each persistent camera path under /dev/v4l/by-path and prompts you to name it.
+5. Detects each persistent camera path under /dev/v4l/by-path and prompts you to name it and assign a tower ID.
 6. Writes a camera mapping file in /opt/hf-snapshot/cameras.json.
 7. Prompts for snapshot schedule times (default: 06:00, 08:00, 10:00, 12:00, 14:00, 16:00, 18:00, 20:00, 22:00, or custom HH:MM times).
 8. Writes /opt/hf-snapshot/.env with your Hugging Face, camera, and ffmpeg settings.
@@ -84,7 +89,7 @@ Main variables:
 Camera mapping file:
 	/opt/hf-snapshot/cameras.json
 
-Each entry maps a persistent device path to a configured camera name.
+Each entry maps a persistent device path to a configured camera name and tower ID.
 
 ## Scheduling
 

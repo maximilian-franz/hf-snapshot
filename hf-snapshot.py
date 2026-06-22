@@ -27,7 +27,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(SCRIPT_DIR / ".env")
 
 
-METADATA_HEADERS = ["file_name", "camera_id", "timestamp"]
+METADATA_HEADERS = ["file_name", "camera_id", "tower_id", "timestamp"]
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
 FFMPEG_INPUT_FORMAT = os.getenv("FFMPEG_INPUT_FORMAT", "mjpeg")
 FFMPEG_VIDEO_SIZE = os.getenv("FFMPEG_VIDEO_SIZE", "3840x2160")
@@ -56,6 +56,7 @@ PREVIEW_IMAGE_QV = 8
 class MetadataRow(TypedDict):
     file_name: str
     camera_id: str
+    tower_id: str
     timestamp: str
 
 
@@ -73,6 +74,7 @@ class Config:
 @dataclass(frozen=True)
 class SnapshotRecord:
     camera_id: str
+    tower_id: str
     local_path: Path
     remote_path: str
     timestamp: str
@@ -82,6 +84,7 @@ class CameraConfigRow(TypedDict):
     device_path: str
     camera_name: str
     rotation: int
+    tower_id: str
 
 
 def setup_logging() -> tuple[logging.Logger, io.StringIO]:
@@ -412,6 +415,10 @@ def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigR
         if camera_name in seen_camera_names:
             raise RuntimeError(f"Camera config contains duplicate camera name: {camera_name}")
 
+        tower_id = (camera.get("tower_id") or "").strip()
+        if not tower_id:
+            logger.warning("Camera config entry %s is missing tower_id; leaving blank", index)
+
         seen_device_paths.add(device_path)
         seen_camera_names.add(camera_name)
         parsed_cameras.append(
@@ -419,6 +426,7 @@ def load_camera_config(path: Path, logger: logging.Logger) -> list[CameraConfigR
                 "device_path": device_path,
                 "camera_name": camera_name,
                 "rotation": rotation,
+                "tower_id": tower_id,
             }
         )
 
@@ -463,7 +471,6 @@ def capture_snapshot(device: str, output: Path, rotation: int, logger: logging.L
             subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
             return
         except subprocess.TimeoutExpired:
-            last_exc = None
             if attempt < CAPTURE_RETRY_COUNT:
                 backoff = CAPTURE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
                 logger.warning(
@@ -570,21 +577,24 @@ def download_metadata_csv(
         return []
 
     rows: list[MetadataRow] = []
+    missing_tower_id_count = 0
     try:
         with open(metadata_path, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                rows.append(
-                    {
-                        "file_name": row["file_name"],
-                        "camera_id": row["camera_id"],
-                        "timestamp": row["timestamp"],
-                    }
-                )
+                if not row.get("tower_id"):
+                    missing_tower_id_count += 1
+                rows.append(row)  # type: ignore[arg-type]
     except (KeyError, csv.Error, ValueError) as exc:
         logger.warning("Failed to parse remote metadata.csv; starting with empty table: %s", exc)
         return []
-    
+
+    if missing_tower_id_count:
+        logger.warning(
+            "%d row(s) in remote metadata.csv have no tower_id (pre-upgrade data); they will be written back with an empty tower_id.",
+            missing_tower_id_count,
+        )
+
     return rows
 
 
@@ -613,6 +623,7 @@ def merge_metadata_rows(
         row = {
             "file_name": f"{record.camera_id}/{record.local_path.name}",
             "camera_id": record.camera_id,
+            "tower_id": record.tower_id,
             "timestamp": record.timestamp,
         }
 
@@ -635,7 +646,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
     logger.info("Starting snapshot capture and publish run.")
 
     if not _ffmpeg_available(logger):
-        return 1, images
+        return 1, []
 
     camera_configs = load_camera_config(config.camera_config_file, logger)
     logger.info(
@@ -660,6 +671,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
         capture_dir = Path(tmpdir)
         for camera in camera_configs:
             camera_id = camera["camera_name"]
+            tower_id = camera["tower_id"]
             device_path = Path(camera["device_path"])
             rotation = int(camera.get("rotation", 0))
             capture_started_at = datetime.now().astimezone()
@@ -680,6 +692,7 @@ def main(logger: Optional[logging.Logger] = None, log_buffer: Optional[io.String
             records.append(
                 SnapshotRecord(
                     camera_id=camera_id,
+                    tower_id=tower_id,
                     local_path=output_path,
                     remote_path=f"{camera_id}/{output_path.name}",
                     timestamp=capture_started_at.isoformat(timespec="seconds"),

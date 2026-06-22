@@ -18,6 +18,7 @@ CAMERA_CONFIG_FILE="$APP_DIR/cameras.json"
 declare -a CAMERA_DEVICES=()
 declare -a CAMERA_NAMES=()
 declare -a CAMERA_ROTATIONS=()
+declare -a CAMERA_TOWER_IDS=()
 declare -a SNAPSHOT_TIMES=()
 declare -a PREVIEW_UNITS=()
 declare -a PREVIEW_DIRS=()
@@ -373,6 +374,7 @@ prompt_camera_enrollment() {
   CAMERA_DEVICES=()
   CAMERA_NAMES=()
   CAMERA_ROTATIONS=()
+  CAMERA_TOWER_IDS=()
 
   # Start one preview service for the whole enrollment lifecycle.
   local preview_dir
@@ -447,9 +449,16 @@ prompt_camera_enrollment() {
       echo "Invalid rotation; please enter one of: 0,90,180,270"
     done
 
+    local tower_id
+    tower_id="$(prompt_input "Tower ID for ${detected_device}: ")"
+    while [[ -z "$tower_id" ]]; do
+      tower_id="$(prompt_input "Tower ID cannot be empty. Enter Tower ID: ")"
+    done
+
     CAMERA_DEVICES+=("$detected_device")
     CAMERA_NAMES+=("$camera_name")
     CAMERA_ROTATIONS+=("$rotation")
+    CAMERA_TOWER_IDS+=("$tower_id")
 
     if [[ $idx -lt $camera_count ]]; then
       echo "Unplug ${detected_device}, then plug in the next camera and press Enter."
@@ -476,7 +485,7 @@ install_camera_config() {
   {
     local idx
     for idx in "${!CAMERA_DEVICES[@]}"; do
-      printf '%s\t%s\t%s\n' "${CAMERA_DEVICES[$idx]}" "${CAMERA_NAMES[$idx]}" "${CAMERA_ROTATIONS[$idx]}"
+      printf '%s\t%s\t%s\t%s\n' "${CAMERA_DEVICES[$idx]}" "${CAMERA_NAMES[$idx]}" "${CAMERA_ROTATIONS[$idx]}" "${CAMERA_TOWER_IDS[$idx]}"
     done
   } >"$mapping_file"
 
@@ -502,7 +511,8 @@ with mapping_path.open("r", encoding="utf-8") as f:
           rotation = int(parts[2])
         except Exception:
           rotation = 0
-      cameras.append({"device_path": device_path, "camera_name": camera_name, "rotation": rotation})
+      tower_id = parts[3].strip() if len(parts) >= 4 else ""
+      cameras.append({"device_path": device_path, "camera_name": camera_name, "rotation": rotation, "tower_id": tower_id})
 
 config_path.write_text(
     json.dumps({"cameras": cameras}, indent=2) + "\n",
@@ -723,7 +733,11 @@ show_summary() {
     echo "Configured cameras:"
     local idx
     for idx in "${!CAMERA_DEVICES[@]}"; do
-      echo "  - ${CAMERA_NAMES[$idx]} -> ${CAMERA_DEVICES[$idx]}"
+      local tower_display=""
+      if [[ -n "${CAMERA_TOWER_IDS[$idx]:-}" ]]; then
+        tower_display=" (tower: ${CAMERA_TOWER_IDS[$idx]})"
+      fi
+      echo "  - ${CAMERA_NAMES[$idx]}${tower_display} -> ${CAMERA_DEVICES[$idx]}"
     done
   fi
 
